@@ -9,7 +9,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait
 
 from config import RESULTS_CHANNEL, SEARCH_REPLY_TTL
-from database.db import get_group, add_user, save_dlt_message, search_index
+from database.db import get_group, add_user, save_dlt_message, search_index, log_search
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +18,7 @@ MAX_RESULTS = 20   # fetch more so dedup has enough to work with; we cap forward
 _EXCLUDED_COMMANDS = [
     "start", "help", "addsource", "connect", "disconnect",
     "connections", "stats", "broadcast", "ping", "verify", "backfill",
-    "status",
+    "status", "trending",
 ]
 
 # Cache the results channel public username to build correct message links.
@@ -101,7 +101,6 @@ _YEAR_RE   = re.compile(r'\b(?:19|20)\d{2}\b')
 _NON_ALPHA = re.compile(r'[^a-z0-9\s]')
 _SPACES    = re.compile(r'\s+')
 
-# file_type priority: higher = prefer this hit over others in the same group
 _FILE_TYPE_RANK: dict[str, int] = {
     "video":     4,
     "document":  3,
@@ -109,20 +108,10 @@ _FILE_TYPE_RANK: dict[str, int] = {
     "photo":     1,
 }
 
-MAX_FORWARD = 10   # cap on unique results forwarded to RESULTS_CHANNEL
+MAX_FORWARD = 10
 
 
 def _canonical(text: str) -> str:
-    """
-    Normalise a title string so near-duplicate entries map to the same key.
-
-    Steps:
-      1. Lowercase
-      2. Strip year (e.g. 2019)
-      3. Strip quality/format/language tags (1080p, BluRay, Hindi, mkv …)
-      4. Strip non-alphanumeric characters
-      5. Collapse whitespace
-    """
     t = text.lower()
     t = _YEAR_RE.sub(" ", t)
     t = _QUALITY_TAGS.sub(" ", t)
@@ -132,21 +121,12 @@ def _canonical(text: str) -> str:
 
 
 def _deduplicate(hits: list) -> list:
-    """
-    Group hits by canonical title, keep one best representative per group.
-
-    Best = highest file_type rank first; ties broken by most recent indexed_at.
-    Group insertion order follows first occurrence in the ranked hit list,
-    so search relevance order is preserved.
-    """
     seen: dict[str, dict] = {}
     order: list[str] = []
 
     for hit in hits:
         raw = (hit.get("file_name") or hit.get("text") or "").strip()
         key = _canonical(raw)
-        # If normalisation strips everything (e.g. purely numeric name), use
-        # a unique fallback so it is never grouped with another hit.
         if not key:
             key = f"__{hit['chat_id']}_{hit['message_id']}"
 
@@ -160,7 +140,6 @@ def _deduplicate(hits: list) -> list:
             prev      = seen[key]
             prev_rank = _FILE_TYPE_RANK.get(prev.get("file_type") or "", 0)
             prev_time = prev.get("indexed_at")
-            # Replace if: better file type, or same type but newer post
             if rank > prev_rank or (
                 rank == prev_rank
                 and hit_time and prev_time
@@ -195,13 +174,16 @@ async def search(bot, message):
             "Use: <code>/addsource add -100xxxxxxxxxx</code>"
         )
 
+    user_id = message.from_user.id if message.from_user else 0
     if message.from_user:
         await add_user(message.from_user.id, message.from_user.first_name)
 
-    # Search the MongoDB index (fetch extra so dedup has enough to work with)
+    # Search the MongoDB index
     raw_hits = await search_index(channels, query, limit=MAX_RESULTS)
 
     if not raw_hits:
+        # Log miss so /trending can show what content is missing
+        asyncio.create_task(log_search(query, user_id, message.chat.id, found=False))
         no_res = await message.reply(
             f"❌ <b>No results found for:</b> <i>{html.escape(query)}</i>\n\n"
             "Please request the group admin 👇"
@@ -209,15 +191,16 @@ async def search(bot, message):
         asyncio.create_task(_auto_delete(no_res, message, delay=60))
         return
 
+    # Log the search (fire-and-forget, never blocks the reply)
+    asyncio.create_task(log_search(query, user_id, message.chat.id, found=True))
+
     # Deduplicate — one best result per unique title
     unique_hits = _deduplicate(raw_hits)
     total_raw   = len(raw_hits)
     total_uniq  = len(unique_hits)
 
-    # Cap at MAX_FORWARD
     to_forward = unique_hits[:MAX_FORWARD]
 
-    # Forward each unique hit to RESULTS_CHANNEL
     sent_msgs = []
     for hit in to_forward:
         fwd = await _send_result(bot, RESULTS_CHANNEL, hit["chat_id"], hit["message_id"])
@@ -232,7 +215,6 @@ async def search(bot, message):
 
     first_url = await _get_results_url(bot, sent_msgs[0].id)
 
-    # Build reply text
     if total_raw > total_uniq:
         result_line = (
             f"🎬 <b>Found {len(sent_msgs)} unique result(s)</b> for: "
