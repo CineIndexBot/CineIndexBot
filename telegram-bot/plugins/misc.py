@@ -7,9 +7,8 @@ from config import OWNER_ID, LOG_CHANNEL
 from database.db import (
     add_group, get_group, add_user, get_groups, get_users,
     get_index_count, get_last_indexed_time,
-    get_trending, get_search_stats,
+    get_trending, get_search_stats, get_scheduler_status,
 )
-from plugins.scheduler import get_scheduler_status
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +38,6 @@ Just send any movie or series name in the group.
 
 
 def _time_ago(dt: datetime) -> str:
-    """Return human-readable 'X ago' string from a UTC datetime."""
     if not dt:
         return "never"
     now = datetime.now(timezone.utc)
@@ -56,7 +54,6 @@ def _time_ago(dt: datetime) -> str:
 
 
 def _time_until(dt: datetime) -> str:
-    """Return 'in X' string for a future datetime."""
     if not dt:
         return "unknown"
     now = datetime.now(timezone.utc)
@@ -155,19 +152,20 @@ async def status_cmd(bot, message):
 
     lines.append(f"\n<b>Total:</b> {total:,} messages indexed")
 
-    # Scheduled reindex info
+    # BUG FIX: was `any(await get_index_count([c]) > 0 for c in channels)`
+    # which uses await inside a sync generator — TypeError at runtime.
+    # total is already computed above, so just check it directly.
+    if total == 0:
+        lines.append("\n💡 Run /backfill to index existing channel history.")
+
+    # Scheduled reindex info — get_scheduler_status is now in db.py (no cross-plugin import)
     sched = await get_scheduler_status()
     if sched["next_run"]:
         last_str = _time_ago(sched["last_run"]) if sched["last_run"] else "never"
         next_str = _time_until(sched["next_run"])
-        lines.append(
-            f"\n🔄 <b>Auto-reindex:</b> last {last_str} | next {next_str}"
-        )
+        lines.append(f"\n🔄 <b>Auto-reindex:</b> last {last_str} | next {next_str}")
     else:
         lines.append("\n🔄 <b>Auto-reindex:</b> first run in ~5 min")
-
-    if total == 0:
-        lines.append("\n💡 Run /backfill to index existing channel history.")
 
     await message.reply("\n".join(lines))
 
@@ -190,16 +188,14 @@ async def trending_cmd(bot, message):
         prefix = medals[i - 1] if i <= 3 else f"{i}."
         label  = html.escape(item["query"])
         count  = item["count"]
-        pct    = item["found_pct"]
-        tag    = " <i>(no results)</i>" if pct < 30 else ""
+        tag    = " <i>(no results)</i>" if item["found_pct"] < 30 else ""
         lines.append(
             f"{prefix} {label} — <b>{count}</b> search{'es' if count != 1 else ''}{tag}"
         )
 
     total  = stats["total"]
     unique = stats["unique"]
-    found  = stats["found_total"]
-    miss   = total - found
+    miss   = total - stats["found_total"]
     lines.append(f"\n📊 {total:,} total searches | {unique:,} unique titles")
     if miss:
         lines.append(
@@ -217,11 +213,10 @@ async def stats(bot, message):
     week_stats   = await get_search_stats(days=7)
     sched        = await get_scheduler_status()
 
-    sched_line = ""
-    if sched["last_run"]:
-        sched_line = f"\n🔄 Last auto-reindex: <b>{_time_ago(sched['last_run'])}</b>"
-    else:
-        sched_line = "\n🔄 Auto-reindex: <b>not yet run</b>"
+    sched_line = (
+        f"\n🔄 Last auto-reindex: <b>{_time_ago(sched['last_run'])}</b>"
+        if sched["last_run"] else "\n🔄 Auto-reindex: <b>not yet run</b>"
+    )
 
     await message.reply(
         f"📊 <b>Bot Statistics</b>\n\n"
