@@ -17,6 +17,8 @@ def _get_db():
             raise RuntimeError("MONGO_URI is not set.")
         _dbclient = AsyncIOMotorClient(
             MONGO_URI,
+            tlsAllowInvalidCertificates=True,
+            tlsAllowInvalidHostnames=True,
             serverSelectionTimeoutMS=15000,
         )
     return _dbclient["CineIndexBot"]
@@ -27,7 +29,7 @@ def _cols():
     return db["GROUPS"], db["USERS"], db["INDEX"], db["Auto-Delete"]
 
 
-# ── Groups ────────────────────────────────────────────────────────────────────
+# -- Groups -------------------------------------------------------------------
 
 async def add_group(group_id, group_name, user_id, channels=None):
     grp_col, _, _, _ = _cols()
@@ -66,7 +68,7 @@ async def get_groups():
     return count, lst
 
 
-# ── Users ─────────────────────────────────────────────────────────────────────
+# -- Users --------------------------------------------------------------------
 
 async def add_user(user_id, name):
     _, user_col, _, _ = _cols()
@@ -88,7 +90,7 @@ async def delete_user(user_id):
     await user_col.delete_one({"_id": user_id})
 
 
-# ── Message Index ─────────────────────────────────────────────────────────────
+# -- Message Index ------------------------------------------------------------
 
 async def index_message(chat_id: int, message_id: int, text: str,
                         file_id: str = None, file_type: str = None,
@@ -112,17 +114,13 @@ async def index_message(chat_id: int, message_id: int, text: str,
 
 
 async def delete_index_message(chat_id: int, message_id: int):
-    """Remove a message from the index when it's deleted from the channel."""
+    """Remove a message from the index when deleted from the channel."""
     _, _, idx_col, _ = _cols()
     await idx_col.delete_one({"chat_id": chat_id, "message_id": message_id})
 
 
 async def search_index(channels: list, query: str, limit: int = 50) -> list:
-    """
-    Search indexed messages in the given channels for the query string.
-    All words in the query must appear in either text or file_name.
-    Uses MongoDB string regex with $options:'i' (Motor-compatible, not Python re objects).
-    """
+    """Search indexed messages. All words must appear in text or file_name."""
     _, _, idx_col, _ = _cols()
     if not channels:
         return []
@@ -162,7 +160,7 @@ async def delete_channel_index(chat_id: int):
     return result.deleted_count
 
 
-# ── Auto-Delete ───────────────────────────────────────────────────────────────
+# -- Auto-Delete --------------------------------------------------------------
 
 async def save_dlt_message(message, time):
     _, _, _, dlt_col = _cols()
@@ -185,7 +183,7 @@ async def delete_all_dlt_data(time):
     await dlt_col.delete_many({"time": {"$lte": time}})
 
 
-# ── Indexes & setup ───────────────────────────────────────────────────────────
+# -- Indexes & setup ----------------------------------------------------------
 
 async def create_indexes():
     try:
