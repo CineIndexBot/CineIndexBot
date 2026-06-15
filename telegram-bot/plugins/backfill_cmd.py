@@ -1,8 +1,7 @@
 """
-/backfill command — trigger channel backfill from Telegram.
+/backfill command — index existing channel history using the bot itself.
 
-Requires SESSION env var in Railway Variables (optional — only needed for /backfill).
-The main bot runs fine without SESSION.
+No SESSION or secondary account needed. The bot must be admin in the channel.
 
 Usage (owner only):
   /backfill                   -> backfill all channels connected to this group
@@ -19,7 +18,7 @@ from typing import Dict
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, ChatAdminRequired, ChannelPrivate
 
-from config import OWNER_ID, API_ID, API_HASH, SESSION
+from config import OWNER_ID
 from database.db import index_message, get_group, get_groups, get_index_count
 
 logger = logging.getLogger(__name__)
@@ -56,10 +55,10 @@ def _fmt(seconds: float) -> str:
     return f"{h}h {m}m"
 
 
-async def _backfill_one_channel(user, prog_msg, ch_id: int, idx: int,
+async def _backfill_one_channel(bot, prog_msg, ch_id: int, idx: int,
                                 total: int, trigger_chat: int) -> int:
     try:
-        chat = await user.get_chat(ch_id)
+        chat = await bot.get_chat(ch_id)
         name = getattr(chat, "title", str(ch_id))
     except Exception:
         name = str(ch_id)
@@ -83,7 +82,7 @@ async def _backfill_one_channel(user, prog_msg, ch_id: int, idx: int,
         last_edit = time.time()
 
         try:
-            async for message in user.get_chat_history(ch_id):
+            async for message in bot.get_chat_history(ch_id):
                 if not _running.get(trigger_chat):
                     raise asyncio.CancelledError()
 
@@ -143,7 +142,7 @@ async def _backfill_one_channel(user, prog_msg, ch_id: int, idx: int,
             await prog_msg.edit(
                 f"❌ <b>[{idx}/{total}] {name}</b>\n"
                 f"Cannot access: {e}\n"
-                f"Ensure the bot is a member/admin."
+                f"Make sure the bot is added as admin in that channel."
             )
             await asyncio.sleep(3)
             return 0
@@ -164,32 +163,17 @@ async def _do_backfill(bot, prog_msg, channel_ids: list, trigger_chat: int):
     overall_start = time.time()
 
     try:
-        from pyrogram import Client as PyroClient
-        async with PyroClient(
-            name="backfill_inline",
-            session_string=SESSION,
-            api_id=API_ID,
-            api_hash=API_HASH,
-            in_memory=True,
-        ) as user:
-            me = await user.get_me()
-            await prog_msg.edit(
-                f"Signed in as <b>{me.first_name}</b>\n"
-                f"Channels to process: <b>{len(channel_ids)}</b>\n\n"
-                f"Starting..."
-            )
-
-            for idx, ch_id in enumerate(channel_ids, 1):
-                if not _running.get(trigger_chat):
-                    await prog_msg.edit("Backfill cancelled.")
-                    return
-                try:
-                    grand_total += await _backfill_one_channel(
-                        user, prog_msg, ch_id, idx, len(channel_ids), trigger_chat
-                    )
-                except asyncio.CancelledError:
-                    await prog_msg.edit("Backfill cancelled.")
-                    return
+        for idx, ch_id in enumerate(channel_ids, 1):
+            if not _running.get(trigger_chat):
+                await prog_msg.edit("Backfill cancelled.")
+                return
+            try:
+                grand_total += await _backfill_one_channel(
+                    bot, prog_msg, ch_id, idx, len(channel_ids), trigger_chat
+                )
+            except asyncio.CancelledError:
+                await prog_msg.edit("Backfill cancelled.")
+                return
 
         total_time = time.time() - overall_start
         await prog_msg.edit(
@@ -212,15 +196,6 @@ async def _do_backfill(bot, prog_msg, channel_ids: list, trigger_chat: int):
 
 @Client.on_message(filters.command("backfill") & filters.user(OWNER_ID))
 async def backfill_cmd(bot, message):
-    if not SESSION:
-        return await message.reply(
-            "<b>SESSION not set.</b>\n\n"
-            "To use /backfill from Telegram:\n"
-            "Railway -> Variables -> add <code>SESSION</code> = your session string.\n\n"
-            "<b>Or run the script directly:</b>\n"
-            "<code>SESSION='...' python telegram-bot/scripts/backfill.py -100xxx</code>"
-        )
-
     args = message.command[1:]
 
     if args and args[0].lower() == "stop":
@@ -247,7 +222,7 @@ async def backfill_cmd(bot, message):
         if not channel_ids:
             return await message.reply("No channels connected in any group.")
         prog = await message.reply(
-            f"<b>Global backfill starting...</b>\n"
+            f"<b>Backfill starting...</b>\n"
             f"{len(channel_ids)} unique channel(s) across all groups.\n\n"
             f"Use <code>/backfill stop</code> to cancel."
         )
