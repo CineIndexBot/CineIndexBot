@@ -2,14 +2,14 @@
 Scheduled auto-reindex — runs every 24 hours in the background.
 
 Catches messages the live indexer missed while the bot was down.
-Completely silent (no Telegram progress messages); summary posted to LOG_CHANNEL.
-Last-run time is persisted in MongoDB so Railway restarts don't reset the clock.
+Silent (no Telegram progress messages); summary posted to LOG_CHANNEL.
+Last-run time persisted in MongoDB so Railway restarts don't reset the clock.
 """
 
 import asyncio
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from pyrogram.errors import FloodWait, ChatAdminRequired, ChannelPrivate
 
@@ -18,10 +18,10 @@ from database.db import index_message, get_groups, get_config, set_config
 
 logger = logging.getLogger(__name__)
 
-INTERVAL_HOURS  = 24
-INTERVAL        = INTERVAL_HOURS * 3600
-WARMUP_DELAY    = 5 * 60   # wait 5 min after bot starts before first ever run
-CONFIG_KEY      = "scheduler_last_run"
+INTERVAL_HOURS = 24
+INTERVAL       = INTERVAL_HOURS * 3600
+WARMUP_DELAY   = 5 * 60
+CONFIG_KEY     = "scheduler_last_run"
 
 _MEDIA_TYPES = ("document", "video", "audio", "animation", "voice", "video_note", "photo")
 
@@ -54,20 +54,25 @@ def _fmt(seconds: float) -> str:
 
 async def _reindex_channel(bot, ch_id: int) -> tuple[int, int]:
     """
-    Re-index all messages in a channel. Returns (indexed_count, skipped_count).
-    Uses upsert so already-indexed messages are updated, not duplicated.
-    Handles FloodWait with up to 3 retries.
+    Re-index all messages in a channel. Returns (indexed, skipped).
+
+    BUG FIX: counters were not reset before each retry attempt.
+    On FloodWait retry the full history is re-iterated from the start,
+    so we must reset per-attempt counters and accumulate into totals.
     """
-    indexed = 0
-    skipped = 0
-    max_retries = 3
+    total_indexed = 0
+    total_skipped = 0
+    max_retries   = 3
 
     for attempt in range(1, max_retries + 1):
+        # Reset per-attempt counters so retry doesn't double-count
+        attempt_indexed = 0
+        attempt_skipped = 0
         try:
             async for message in bot.get_chat_history(ch_id):
                 text, file_name, file_id, file_type = _extract(message)
                 if not f"{text} {file_name}".strip():
-                    skipped += 1
+                    attempt_skipped += 1
                     continue
                 try:
                     await index_message(
@@ -78,33 +83,42 @@ async def _reindex_channel(bot, ch_id: int) -> tuple[int, int]:
                         file_type=file_type,
                         file_name=file_name,
                     )
-                    indexed += 1
+                    attempt_indexed += 1
                 except Exception as e:
                     logger.warning("Scheduler index error msg %d: %s", message.id, e)
-            return indexed, skipped
+
+            # Successful full pass
+            return total_indexed + attempt_indexed, total_skipped + attempt_skipped
 
         except FloodWait as e:
             wait = e.value + 10
-            logger.warning("Scheduler FloodWait %ds on channel %d (attempt %d/%d)",
-                           e.value, ch_id, attempt, max_retries)
+            logger.warning(
+                "Scheduler FloodWait %ds on channel %d (attempt %d/%d)",
+                e.value, ch_id, attempt, max_retries,
+            )
+            # Do NOT accumulate partial attempt_indexed — we'll retry from scratch
             await asyncio.sleep(wait)
+
         except (ChatAdminRequired, ChannelPrivate) as e:
             logger.warning("Scheduler cannot access channel %d: %s", ch_id, e)
-            return indexed, skipped
+            return total_indexed + attempt_indexed, total_skipped + attempt_skipped
+
         except asyncio.CancelledError:
             raise
-        except Exception as e:
-            logger.warning("Scheduler error on channel %d: %s", ch_id, e)
-            return indexed, skipped
 
-    return indexed, skipped
+        except Exception as e:
+            logger.warning("Scheduler error on channel %d (attempt %d): %s",
+                           ch_id, attempt, e)
+            return total_indexed + attempt_indexed, total_skipped + attempt_skipped
+
+    # All retries exhausted
+    return total_indexed, total_skipped
 
 
 async def _run_full_reindex(bot):
     """Re-index every channel across all groups. Posts summary to LOG_CHANNEL."""
     _, groups = await get_groups()
 
-    # Collect unique channel IDs across all groups
     seen: set = set()
     channel_ids = []
     for g in groups:
@@ -124,7 +138,7 @@ async def _run_full_reindex(bot):
             await bot.send_message(
                 LOG_CHANNEL,
                 f"🔄 <b>Scheduled reindex started</b>\n"
-                f"Channels: <b>{len(channel_ids)}</b>"
+                f"Channels: <b>{len(channel_ids)}</b>",
             )
         except Exception:
             pass
@@ -136,10 +150,10 @@ async def _run_full_reindex(bot):
 
     for ch_id in channel_ids:
         try:
-            ch_indexed, ch_skipped = await _reindex_channel(bot, ch_id)
-            total_indexed += ch_indexed
-            total_skipped += ch_skipped
-            logger.info("Scheduler indexed %d from channel %d", ch_indexed, ch_id)
+            ch_idx, ch_skip = await _reindex_channel(bot, ch_id)
+            total_indexed += ch_idx
+            total_skipped += ch_skip
+            logger.info("Scheduler indexed %d from channel %d", ch_idx, ch_id)
         except asyncio.CancelledError:
             logger.info("Scheduled reindex cancelled mid-run.")
             return
@@ -148,16 +162,12 @@ async def _run_full_reindex(bot):
             failed_channels.append(ch_id)
 
     elapsed = time.time() - overall_start
-
-    logger.info(
-        "Scheduled reindex complete: %d indexed, %d skipped, %s",
-        total_indexed, total_skipped, _fmt(elapsed)
-    )
+    logger.info("Scheduled reindex complete: %d indexed, %d skipped, %s",
+                total_indexed, total_skipped, _fmt(elapsed))
 
     if LOG_CHANNEL:
         fail_note = (
-            f"\n⚠️ {len(failed_channels)} channel(s) failed"
-            if failed_channels else ""
+            f"\n⚠️ {len(failed_channels)} channel(s) failed" if failed_channels else ""
         )
         try:
             await bot.send_message(
@@ -166,7 +176,7 @@ async def _run_full_reindex(bot):
                 f"Indexed: <b>{total_indexed:,}</b> messages\n"
                 f"Channels: <b>{len(channel_ids)}</b>\n"
                 f"Time: <b>{_fmt(elapsed)}</b>{fail_note}\n\n"
-                f"Next run in <b>{INTERVAL_HOURS}h</b>"
+                f"Next run in <b>{INTERVAL_HOURS}h</b>",
             )
         except Exception:
             pass
@@ -175,12 +185,8 @@ async def _run_full_reindex(bot):
 async def scheduled_backfill_loop(bot):
     """
     Main scheduler loop. Runs forever until cancelled.
-
-    On startup:
-      - Reads last_run from MongoDB.
-      - If overdue (or never run): waits WARMUP_DELAY then runs immediately.
-      - Otherwise: sleeps until the 24h window is up.
-    After each run: records timestamp, sleeps 24h.
+    Reads/writes last-run timestamp from MongoDB so Railway restarts
+    don't reset the 24h clock.
     """
     while True:
         try:
@@ -188,19 +194,17 @@ async def scheduled_backfill_loop(bot):
             now      = datetime.utcnow()
 
             if last_run is None:
-                # First ever run — give the bot a few minutes to fully settle
-                logger.info("Scheduler: no previous run found. First run in %ds.", WARMUP_DELAY)
+                logger.info("Scheduler: first ever run in %ds.", WARMUP_DELAY)
                 await asyncio.sleep(WARMUP_DELAY)
             else:
-                elapsed = (now - last_run).total_seconds()
+                elapsed   = (now - last_run).total_seconds()
                 remaining = INTERVAL - elapsed
                 if remaining > 0:
-                    next_run_dt = now + timedelta(seconds=remaining)
+                    from datetime import timedelta
+                    next_dt = now + timedelta(seconds=remaining)
                     logger.info(
-                        "Scheduler: last run %s ago. Next run at %s UTC (~%s).",
-                        _fmt(elapsed),
-                        next_run_dt.strftime("%Y-%m-%d %H:%M"),
-                        _fmt(remaining),
+                        "Scheduler: last run %s ago. Next at %s UTC.",
+                        _fmt(elapsed), next_dt.strftime("%Y-%m-%d %H:%M"),
                     )
                     await asyncio.sleep(remaining)
                 else:
@@ -208,8 +212,6 @@ async def scheduled_backfill_loop(bot):
 
             await _run_full_reindex(bot)
             await set_config(CONFIG_KEY, datetime.utcnow())
-
-            # Sleep until next 24h window
             await asyncio.sleep(INTERVAL)
 
         except asyncio.CancelledError:
@@ -218,15 +220,3 @@ async def scheduled_backfill_loop(bot):
         except Exception as e:
             logger.exception("Scheduler unexpected error: %s — retrying in 1h", e)
             await asyncio.sleep(3600)
-
-
-async def get_scheduler_status() -> dict:
-    """
-    Returns scheduler state for display in /status.
-    {"last_run": datetime|None, "next_run": datetime|None}
-    """
-    last_run = await get_config(CONFIG_KEY)
-    if last_run is None:
-        return {"last_run": None, "next_run": None}
-    next_run = last_run + timedelta(seconds=INTERVAL)
-    return {"last_run": last_run, "next_run": next_run}
