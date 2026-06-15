@@ -60,7 +60,8 @@ async def _backfill_one_channel(user, prog_msg, ch_id: int, idx: int,
                                 total: int, trigger_chat: int) -> int:
     """
     Index all messages from one channel. Returns count of indexed messages.
-    Retries after FloodWait instead of abandoning the channel.
+    On FloodWait, sleeps and resumes iteration — count/skipped are reset
+    per attempt so progress display stays accurate after a retry.
     """
     try:
         chat = await user.get_chat(ch_id)
@@ -69,22 +70,25 @@ async def _backfill_one_channel(user, prog_msg, ch_id: int, idx: int,
         name = str(ch_id)
 
     already = await get_index_count([ch_id])
-    count   = 0
-    skipped = 0
-    start   = time.time()
-    last_edit = start
+    grand_count   = 0
+    grand_skipped = 0
+    start         = time.time()
 
     await prog_msg.edit(
-        f"⏳ <b>[{idx}/{total}] {name}</b>\n"
-        f"Already indexed: {already}\n"
+        f"⏳ <b>[{idx}/{total}] {name}</b>
+"
+        f"Already indexed: {already}
+"
         f"Starting…"
     )
 
     max_retries = 3
-    attempt = 0
 
-    while attempt < max_retries:
-        attempt += 1
+    for attempt in range(1, max_retries + 1):
+        count   = 0
+        skipped = 0
+        last_edit = time.time()
+
         try:
             async for message in user.get_chat_history(ch_id):
                 if not _running.get(trigger_chat):
@@ -111,51 +115,64 @@ async def _backfill_one_channel(user, prog_msg, ch_id: int, idx: int,
                 now = time.time()
                 if now - last_edit >= 8:
                     elapsed = now - start
-                    rate = count / elapsed if elapsed > 0 else 0
+                    rate = count / max(elapsed, 1)
                     try:
                         await prog_msg.edit(
-                            f"⏳ <b>[{idx}/{total}] {name}</b>\n"
-                            f"✅ Indexed: <b>{count}</b> | ⏭ Skipped: {skipped}\n"
+                            f"⏳ <b>[{idx}/{total}] {name}</b>
+"
+                            f"✅ Indexed: <b>{count}</b> | ⏭ Skipped: {skipped}
+"
                             f"⚡ {rate:.1f} msg/s | ⏱ {_fmt(elapsed)}"
+                            + (f" | attempt {attempt}/{max_retries}" if attempt > 1 else "")
                         )
                     except Exception:
                         pass
                     last_edit = now
 
-            # Completed successfully — break retry loop
+            # Completed without FloodWait — accumulate and break
+            grand_count   += count
+            grand_skipped += skipped
             break
 
         except asyncio.CancelledError:
-            raise  # Propagate stop signal
+            raise
         except FloodWait as e:
             wait = e.value + 5
+            grand_count   += count
+            grand_skipped += skipped
             try:
                 await prog_msg.edit(
-                    f"⏳ <b>[{idx}/{total}] {name}</b>\n"
-                    f"FloodWait {e.value}s — resuming in {wait}s… (attempt {attempt}/{max_retries})"
+                    f"⏳ <b>[{idx}/{total}] {name}</b>
+"
+                    f"FloodWait {e.value}s — resuming in {wait}s… (attempt {attempt}/{max_retries})
+"
+                    f"Indexed so far: {grand_count}"
                 )
             except Exception:
                 pass
             await asyncio.sleep(wait)
-            # Loop continues — retries get_chat_history from beginning
-            # Messages already indexed are upserted (no duplicates)
+            # Next attempt restarts get_chat_history; upsert ensures no duplicates
         except (ChatAdminRequired, ChannelPrivate) as e:
             await prog_msg.edit(
-                f"❌ <b>[{idx}/{total}] {name}</b>\n"
-                f"Cannot access: {e}\n"
-                f"Ensure the secondary account is a member."
+                f"❌ <b>[{idx}/{total}] {name}</b>
+"
+                f"Cannot access: {e}
+"
+                f"Ensure the bot is a member/admin."
             )
             await asyncio.sleep(3)
             return 0
 
     elapsed = time.time() - start
     await prog_msg.edit(
-        f"✅ <b>[{idx}/{total}] {name}</b> done!\n"
-        f"Indexed: <b>{count}</b> | Skipped: {skipped} | Time: {_fmt(elapsed)}\n"
+        f"✅ <b>[{idx}/{total}] {name}</b> done!
+"
+        f"Indexed: <b>{grand_count}</b> | Skipped: {grand_skipped} | Time: {_fmt(elapsed)}
+"
         f"{'Processing next…' if idx < total else ''}"
     )
     await asyncio.sleep(1)
-    return count
+    return grand_count
 
 
 async def _do_backfill(bot, prog_msg, channel_ids: list, trigger_chat: int):
@@ -175,8 +192,11 @@ async def _do_backfill(bot, prog_msg, channel_ids: list, trigger_chat: int):
         ) as user:
             me = await user.get_me()
             await prog_msg.edit(
-                f"🔑 Signed in as <b>{me.first_name}</b>\n"
-                f"📡 Channels to process: <b>{len(channel_ids)}</b>\n\n"
+                f"🔑 Signed in as <b>{me.first_name}</b>
+"
+                f"📡 Channels to process: <b>{len(channel_ids)}</b>
+
+"
                 f"Starting…"
             )
 
@@ -194,10 +214,16 @@ async def _do_backfill(bot, prog_msg, channel_ids: list, trigger_chat: int):
 
         total_time = time.time() - overall_start
         await prog_msg.edit(
-            f"🎉 <b>Backfill complete!</b>\n\n"
-            f"📦 Total indexed: <b>{grand_total}</b> messages\n"
-            f"📡 Channels processed: <b>{len(channel_ids)}</b>\n"
-            f"⏱ Total time: <b>{_fmt(total_time)}</b>\n\n"
+            f"🎉 <b>Backfill complete!</b>
+
+"
+            f"📦 Total indexed: <b>{grand_total}</b> messages
+"
+            f"📡 Channels processed: <b>{len(channel_ids)}</b>
+"
+            f"⏱ Total time: <b>{_fmt(total_time)}</b>
+
+"
             f"Search is now fully active for all indexed content."
         )
 
@@ -215,10 +241,16 @@ async def _do_backfill(bot, prog_msg, channel_ids: list, trigger_chat: int):
 async def backfill_cmd(bot, message):
     if not SESSION:
         return await message.reply(
-            "❌ <b>SESSION not set.</b>\n\n"
-            "To use /backfill from Telegram:\n"
-            "Railway → Variables → add <code>SESSION</code> = your secondary account's session string.\n\n"
-            "<b>Or run the script directly:</b>\n"
+            "❌ <b>SESSION not set.</b>
+
+"
+            "To use /backfill from Telegram:
+"
+            "Railway → Variables → add <code>SESSION</code> = your secondary account's session string.
+
+"
+            "<b>Or run the script directly:</b>
+"
             "<code>SESSION='...' python telegram-bot/scripts/backfill.py -100xxx</code>"
         )
 
@@ -234,7 +266,8 @@ async def backfill_cmd(bot, message):
     # Guard: don't start two at once in the same chat
     if _running.get(message.chat.id):
         return await message.reply(
-            "⚠️ A backfill is already running.\n"
+            "⚠️ A backfill is already running.
+"
             "Use <code>/backfill stop</code> to cancel it first."
         )
 
@@ -251,8 +284,11 @@ async def backfill_cmd(bot, message):
         if not channel_ids:
             return await message.reply("📭 No channels connected in any group.")
         prog = await message.reply(
-            f"🔄 <b>Global backfill starting…</b>\n"
-            f"📡 {len(channel_ids)} unique channel(s) across all groups.\n\n"
+            f"🔄 <b>Global backfill starting…</b>
+"
+            f"📡 {len(channel_ids)} unique channel(s) across all groups.
+
+"
             f"Use <code>/backfill stop</code> to cancel."
         )
         asyncio.create_task(_do_backfill(bot, prog, channel_ids, message.chat.id))
@@ -264,12 +300,16 @@ async def backfill_cmd(bot, message):
             channel_ids = [int(a) for a in args]
         except ValueError:
             return await message.reply(
-                "❌ Invalid channel ID.\n"
+                "❌ Invalid channel ID.
+"
                 "Usage: <code>/backfill -100xxxxxxxxxx</code>"
             )
         prog = await message.reply(
-            f"🔄 <b>Backfill starting…</b>\n"
-            f"📡 {len(channel_ids)} channel(s)\n\n"
+            f"🔄 <b>Backfill starting…</b>
+"
+            f"📡 {len(channel_ids)} channel(s)
+
+"
             f"Use <code>/backfill stop</code> to cancel."
         )
         asyncio.create_task(_do_backfill(bot, prog, channel_ids, message.chat.id))
@@ -283,13 +323,17 @@ async def backfill_cmd(bot, message):
     channel_ids = group.get("channels", [])
     if not channel_ids:
         return await message.reply(
-            "📭 No source channels connected to this group.\n"
+            "📭 No source channels connected to this group.
+"
             "Use: <code>/addsource add -100xxxxxxxxxx</code>"
         )
 
     prog = await message.reply(
-        f"🔄 <b>Backfill starting…</b>\n"
-        f"📡 {len(channel_ids)} channel(s) connected to this group.\n\n"
+        f"🔄 <b>Backfill starting…</b>
+"
+        f"📡 {len(channel_ids)} channel(s) connected to this group.
+
+"
         f"Use <code>/backfill stop</code> to cancel."
     )
     asyncio.create_task(_do_backfill(bot, prog, channel_ids, message.chat.id))
