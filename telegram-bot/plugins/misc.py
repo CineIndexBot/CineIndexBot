@@ -20,7 +20,12 @@ Just send any movie or series name in the group.
 /addsource list — show connected channels
 /addsource add ‹id› — add a source channel
 /addsource remove ‹id› — remove a channel
+/backfill — index old messages from connected channels
+/backfill -100xxx — index a specific channel
+/backfill all — index all channels across all groups
+/backfill stop — cancel a running backfill
 /stats — bot statistics (owner only)
+/ping — check if bot is alive
 """
 
 

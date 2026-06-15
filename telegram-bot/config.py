@@ -27,5 +27,9 @@ WELCOME_TTL      = 120
 HEALTH_PORT = int(os.environ.get("HEALTH_PORT", os.environ.get("PORT", 5000)))
 PORT        = HEALTH_PORT
 
+# Optional — only needed for /backfill Telegram command and the backfill script.
+# The main bot runs perfectly without this.
+SESSION = os.environ.get("SESSION") or os.environ.get("SESSION_SECRET", "")
+
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise RuntimeError("API_ID, API_HASH, and BOT_TOKEN are required. No SESSION needed for this bot.")
