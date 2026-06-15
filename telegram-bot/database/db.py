@@ -148,8 +148,11 @@ async def search_index(channels: list, query: str, limit: int = 50) -> list:
 
 
 async def get_index_count(channels: list = None) -> int:
+    """Count indexed messages. Pass channels=None to count all; [] returns 0."""
     _, _, idx_col, _ = _cols()
-    filt = {"chat_id": {"$in": channels}} if channels else {}
+    if channels is not None and len(channels) == 0:
+        return 0
+    filt = {"chat_id": {"$in": channels}} if channels is not None else {}
     return await idx_col.count_documents(filt)
 
 
