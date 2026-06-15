@@ -41,14 +41,13 @@ def _config_col():
 
 async def add_group(group_id, group_name, user_id, channels=None):
     grp_col, _, _, _ = _cols()
-    data = {
-        "_id":      group_id,
-        "name":     group_name,
-        "user_id":  user_id,
-        "channels": channels or [],
-    }
     try:
-        await grp_col.insert_one(data)
+        await grp_col.insert_one({
+            "_id":      group_id,
+            "name":     group_name,
+            "user_id":  user_id,
+            "channels": channels or [],
+        })
     except DuplicateKeyError:
         pass
 
@@ -72,7 +71,7 @@ async def delete_group(group_id):
 async def get_groups():
     grp_col, _, _, _ = _cols()
     count = await grp_col.count_documents({})
-    lst = await grp_col.find({}).to_list(length=max(int(count), 1))
+    lst   = await grp_col.find({}).to_list(length=max(int(count), 1))
     return count, lst
 
 
@@ -89,7 +88,7 @@ async def add_user(user_id, name):
 async def get_users():
     _, user_col, _, _ = _cols()
     count = await user_col.count_documents({})
-    lst = await user_col.find({}).to_list(length=max(int(count), 1))
+    lst   = await user_col.find({}).to_list(length=max(int(count), 1))
     return count, lst
 
 
@@ -103,60 +102,51 @@ async def delete_user(user_id):
 async def index_message(chat_id: int, message_id: int, text: str,
                         file_id: str = None, file_type: str = None,
                         file_name: str = ""):
-    """Save a channel post to the search index. Upserts by (chat_id, message_id)."""
+    """Upsert a channel post into the search index."""
     _, _, idx_col, _ = _cols()
-    doc = {
-        "chat_id":    chat_id,
-        "message_id": message_id,
-        "text":       text.lower(),
-        "file_name":  file_name.lower(),
-        "file_id":    file_id,
-        "file_type":  file_type,
-        "indexed_at": datetime.utcnow(),
-    }
     await idx_col.update_one(
         {"chat_id": chat_id, "message_id": message_id},
-        {"$set": doc},
+        {"$set": {
+            "chat_id":    chat_id,
+            "message_id": message_id,
+            "text":       text.lower(),
+            "file_name":  file_name.lower(),
+            "file_id":    file_id,
+            "file_type":  file_type,
+            "indexed_at": datetime.utcnow(),
+        }},
         upsert=True,
     )
 
 
 async def delete_index_message(chat_id: int, message_id: int):
-    """Remove a message from the index when deleted from the channel."""
     _, _, idx_col, _ = _cols()
     await idx_col.delete_one({"chat_id": chat_id, "message_id": message_id})
 
 
 async def search_index(channels: list, query: str, limit: int = 50) -> list:
-    """Search indexed messages. All words must appear in text or file_name."""
+    """Full-text search: all query words must appear in text or file_name."""
     _, _, idx_col, _ = _cols()
     if not channels:
         return []
-
     words = query.lower().strip().split()
     if not words:
         return []
-
     and_conditions = []
     for word in words:
         escaped = re.escape(word)
-        and_conditions.append({
-            "$or": [
-                {"text":      {"$regex": escaped, "$options": "i"}},
-                {"file_name": {"$regex": escaped, "$options": "i"}},
-            ]
-        })
-
-    mongo_filter = {
-        "chat_id": {"$in": channels},
-        "$and": and_conditions,
-    }
-    cursor = idx_col.find(mongo_filter).sort("indexed_at", -1).limit(limit)
+        and_conditions.append({"$or": [
+            {"text":      {"$regex": escaped, "$options": "i"}},
+            {"file_name": {"$regex": escaped, "$options": "i"}},
+        ]})
+    cursor = idx_col.find(
+        {"chat_id": {"$in": channels}, "$and": and_conditions}
+    ).sort("indexed_at", -1).limit(limit)
     return await cursor.to_list(length=limit)
 
 
 async def get_index_count(channels: list = None) -> int:
-    """Count indexed messages. Pass channels=None to count all; [] returns 0."""
+    """Count indexed messages. channels=None → all; channels=[] → 0."""
     _, _, idx_col, _ = _cols()
     if channels is not None and len(channels) == 0:
         return 0
@@ -165,7 +155,7 @@ async def get_index_count(channels: list = None) -> int:
 
 
 async def get_last_indexed_time(chat_id: int):
-    """Return the datetime of the most recently indexed message for a channel, or None."""
+    """Most recent indexed_at for a channel, or None."""
     _, _, idx_col, _ = _cols()
     doc = await idx_col.find_one(
         {"chat_id": chat_id},
@@ -176,7 +166,6 @@ async def get_last_indexed_time(chat_id: int):
 
 
 async def delete_channel_index(chat_id: int):
-    """Wipe all indexed messages for a channel."""
     _, _, idx_col, _ = _cols()
     result = await idx_col.delete_many({"chat_id": chat_id})
     return result.deleted_count
@@ -189,7 +178,6 @@ _WS_RE   = re.compile(r'\s+')
 
 
 def _normalize_query(q: str) -> str:
-    """Lowercase + strip non-alphanumeric for grouping near-identical queries."""
     t = q.lower().strip()
     t = _NORM_RE.sub(' ', t)
     t = _WS_RE.sub(' ', t).strip()
@@ -197,7 +185,6 @@ def _normalize_query(q: str) -> str:
 
 
 async def log_search(query: str, user_id: int, chat_id: int, found: bool = True):
-    """Record a search event for trending analytics."""
     col = _search_col()
     try:
         await col.insert_one({
@@ -213,24 +200,19 @@ async def log_search(query: str, user_id: int, chat_id: int, found: bool = True)
 
 
 async def get_trending(limit: int = 10, days: int = 7) -> list[dict]:
-    """Return top `limit` searches from the last `days` days."""
-    col = _search_col()
+    col   = _search_col()
     since = datetime.utcnow() - timedelta(days=days)
-
     pipeline = [
         {"$match": {"searched_at": {"$gte": since}}},
-        {
-            "$group": {
-                "_id":         "$query_norm",
-                "count":       {"$sum": 1},
-                "found_sum":   {"$sum": {"$cond": ["$found", 1, 0]}},
-                "raw_queries": {"$push": "$query"},
-            }
-        },
+        {"$group": {
+            "_id":         "$query_norm",
+            "count":       {"$sum": 1},
+            "found_sum":   {"$sum": {"$cond": ["$found", 1, 0]}},
+            "raw_queries": {"$push": "$query"},
+        }},
         {"$sort": {"count": -1}},
         {"$limit": limit},
     ]
-
     results = await col.aggregate(pipeline).to_list(length=limit)
     out = []
     for r in results:
@@ -247,19 +229,16 @@ async def get_trending(limit: int = 10, days: int = 7) -> list[dict]:
 
 
 async def get_search_stats(days: int = 7) -> dict:
-    """Return total searches and unique queries in the last `days` days."""
-    col = _search_col()
+    col   = _search_col()
     since = datetime.utcnow() - timedelta(days=days)
     pipeline = [
         {"$match": {"searched_at": {"$gte": since}}},
-        {
-            "$group": {
-                "_id":          None,
-                "total":        {"$sum": 1},
-                "found_total":  {"$sum": {"$cond": ["$found", 1, 0]}},
-                "unique_norms": {"$addToSet": "$query_norm"},
-            }
-        },
+        {"$group": {
+            "_id":          None,
+            "total":        {"$sum": 1},
+            "found_total":  {"$sum": {"$cond": ["$found", 1, 0]}},
+            "unique_norms": {"$addToSet": "$query_norm"},
+        }},
     ]
     res = await col.aggregate(pipeline).to_list(length=1)
     if not res:
@@ -272,10 +251,10 @@ async def get_search_stats(days: int = 7) -> dict:
     }
 
 
-# -- Config (key-value store for bot state) -----------------------------------
+# -- Config & Scheduler State -------------------------------------------------
 
 async def get_config(key: str):
-    """Retrieve a config value by key. Returns None if not set."""
+    """Retrieve a persisted config value by key. Returns None if not set."""
     col = _config_col()
     doc = await col.find_one({"_id": key})
     return doc["value"] if doc else None
@@ -291,6 +270,20 @@ async def set_config(key: str, value):
     )
 
 
+async def get_scheduler_status() -> dict:
+    """
+    Returns scheduler state for /status and /stats display.
+    Kept here (not in scheduler.py) to avoid cross-plugin imports in misc.py.
+    Returns {"last_run": datetime|None, "next_run": datetime|None}
+    """
+    from plugins.scheduler import CONFIG_KEY, INTERVAL
+    last_run = await get_config(CONFIG_KEY)
+    if last_run is None:
+        return {"last_run": None, "next_run": None}
+    next_run = last_run + timedelta(seconds=INTERVAL)
+    return {"last_run": last_run, "next_run": next_run}
+
+
 # -- Auto-Delete --------------------------------------------------------------
 
 async def save_dlt_message(message, time):
@@ -304,7 +297,7 @@ async def save_dlt_message(message, time):
 
 async def get_all_dlt_data(time):
     _, _, _, dlt_col = _cols()
-    filt = {"time": {"$lte": time}}
+    filt  = {"time": {"$lte": time}}
     count = await dlt_col.count_documents(filt)
     return await dlt_col.find(filt).to_list(length=max(int(count), 1))
 
