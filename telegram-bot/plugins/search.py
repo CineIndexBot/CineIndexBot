@@ -19,7 +19,8 @@ _EXCLUDED_COMMANDS = [
     "connections", "stats", "broadcast", "ping", "verify", "backfill",
 ]
 
-# Cache the results channel public username to build correct message links
+# Cache the results channel public username to build correct message links.
+# Only cached on success — transient failures retry on next search.
 _results_channel_username: str | None = None
 _results_channel_resolved: bool = False
 
@@ -30,9 +31,10 @@ async def _get_results_url(bot, message_id: int) -> str:
         try:
             chat = await bot.get_chat(RESULTS_CHANNEL)
             _results_channel_username = getattr(chat, "username", None)
+            _results_channel_resolved = True   # only cache on success
         except Exception:
             _results_channel_username = None
-        _results_channel_resolved = True
+            # leave _results_channel_resolved = False so we retry next time
 
     if _results_channel_username:
         return f"https://t.me/{_results_channel_username}/{message_id}"
