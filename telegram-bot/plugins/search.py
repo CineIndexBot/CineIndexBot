@@ -87,8 +87,7 @@ async def search(bot, message):
     channels = group.get("channels", [])
     if not channels:
         return await message.reply(
-            "📭 No source channels connected.
-"
+            "📭 No source channels connected.\n"
             "Use: <code>/addsource add -100xxxxxxxxxx</code>"
         )
 
@@ -100,9 +99,7 @@ async def search(bot, message):
 
     if not hits:
         no_res = await message.reply(
-            f"❌ <b>No results found for:</b> <i>{html.escape(query)}</i>
-
-"
+            f"❌ <b>No results found for:</b> <i>{html.escape(query)}</i>\n\n"
             "Please request the group admin 👇"
         )
         asyncio.create_task(_auto_delete(no_res, message, delay=60))
@@ -117,8 +114,7 @@ async def search(bot, message):
 
     if not sent_msgs:
         return await message.reply(
-            "⚠️ Found results but could not forward them.
-"
+            "⚠️ Found results but could not forward them.\n"
             "Make sure the bot is admin in the RESULTS_CHANNEL."
         )
 
