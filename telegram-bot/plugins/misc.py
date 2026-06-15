@@ -9,6 +9,7 @@ from database.db import (
     get_index_count, get_last_indexed_time,
     get_trending, get_search_stats,
 )
+from plugins.scheduler import get_scheduler_status
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ Just send any movie or series name in the group.
 /backfill -100xxx — index a specific channel
 /backfill all — index all channels across all groups
 /backfill stop — cancel a running backfill
-/status — index status per channel
+/status — index status + scheduled reindex info
 /trending — top 10 searches this week
 /stats — bot statistics (owner only)
 /ping — check if bot is alive
@@ -52,6 +53,23 @@ def _time_ago(dt: datetime) -> str:
     if diff < 86400:
         return f"{diff // 3600}h ago"
     return f"{diff // 86400}d ago"
+
+
+def _time_until(dt: datetime) -> str:
+    """Return 'in X' string for a future datetime."""
+    if not dt:
+        return "unknown"
+    now = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    diff = int((dt - now).total_seconds())
+    if diff <= 0:
+        return "now"
+    if diff < 3600:
+        return f"in {diff // 60}m"
+    if diff < 86400:
+        return f"in {diff // 3600}h {(diff % 3600) // 60}m"
+    return f"in {diff // 86400}d {(diff % 86400) // 3600}h"
 
 
 @Client.on_message(filters.command("start"))
@@ -136,7 +154,19 @@ async def status_cmd(bot, message):
         )
 
     lines.append(f"\n<b>Total:</b> {total:,} messages indexed")
-    if not any(await get_index_count([c]) > 0 for c in channels):
+
+    # Scheduled reindex info
+    sched = await get_scheduler_status()
+    if sched["next_run"]:
+        last_str = _time_ago(sched["last_run"]) if sched["last_run"] else "never"
+        next_str = _time_until(sched["next_run"])
+        lines.append(
+            f"\n🔄 <b>Auto-reindex:</b> last {last_str} | next {next_str}"
+        )
+    else:
+        lines.append("\n🔄 <b>Auto-reindex:</b> first run in ~5 min")
+
+    if total == 0:
         lines.append("\n💡 Run /backfill to index existing channel history.")
 
     await message.reply("\n".join(lines))
@@ -144,7 +174,6 @@ async def status_cmd(bot, message):
 
 @Client.on_message(filters.command("trending"))
 async def trending_cmd(bot, message):
-    """Top 10 most-searched titles this week. Available to all group members."""
     trending = await get_trending(limit=10, days=7)
     stats    = await get_search_stats(days=7)
 
@@ -162,17 +191,16 @@ async def trending_cmd(bot, message):
         label  = html.escape(item["query"])
         count  = item["count"]
         pct    = item["found_pct"]
-        # Show a "no results" tag if the majority of searches came up empty
-        tag = " <i>(no results)</i>" if pct < 30 else ""
-        lines.append(f"{prefix} {label} — <b>{count}</b> search{'es' if count != 1 else ''}{tag}")
+        tag    = " <i>(no results)</i>" if pct < 30 else ""
+        lines.append(
+            f"{prefix} {label} — <b>{count}</b> search{'es' if count != 1 else ''}{tag}"
+        )
 
-    total   = stats["total"]
-    unique  = stats["unique"]
-    found   = stats["found_total"]
-    miss    = total - found
-    lines.append(
-        f"\n📊 {total:,} total searches | {unique:,} unique titles"
-    )
+    total  = stats["total"]
+    unique = stats["unique"]
+    found  = stats["found_total"]
+    miss   = total - found
+    lines.append(f"\n📊 {total:,} total searches | {unique:,} unique titles")
     if miss:
         lines.append(
             f"❓ {miss:,} searches returned no results — consider adding those channels"
@@ -187,11 +215,20 @@ async def stats(bot, message):
     usr_count, _ = await get_users()
     idx_count    = await get_index_count()
     week_stats   = await get_search_stats(days=7)
+    sched        = await get_scheduler_status()
+
+    sched_line = ""
+    if sched["last_run"]:
+        sched_line = f"\n🔄 Last auto-reindex: <b>{_time_ago(sched['last_run'])}</b>"
+    else:
+        sched_line = "\n🔄 Auto-reindex: <b>not yet run</b>"
+
     await message.reply(
         f"📊 <b>Bot Statistics</b>\n\n"
         f"👥 Groups: <b>{grp_count}</b>\n"
         f"👤 Users: <b>{usr_count}</b>\n"
-        f"📦 Indexed messages: <b>{idx_count:,}</b>\n\n"
+        f"📦 Indexed messages: <b>{idx_count:,}</b>\n"
+        f"{sched_line}\n\n"
         f"🔍 Searches this week: <b>{week_stats['total']:,}</b>\n"
         f"🎯 With results: <b>{week_stats['found_total']:,}</b>\n"
         f"❓ No results: <b>{week_stats['total'] - week_stats['found_total']:,}</b>"
