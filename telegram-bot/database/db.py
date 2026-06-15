@@ -156,6 +156,17 @@ async def get_index_count(channels: list = None) -> int:
     return await idx_col.count_documents(filt)
 
 
+async def get_last_indexed_time(chat_id: int):
+    """Return the datetime of the most recently indexed message for a channel, or None."""
+    _, _, idx_col, _ = _cols()
+    doc = await idx_col.find_one(
+        {"chat_id": chat_id},
+        sort=[("indexed_at", -1)],
+        projection={"indexed_at": 1},
+    )
+    return doc["indexed_at"] if doc else None
+
+
 async def delete_channel_index(chat_id: int):
     """Wipe all indexed messages for a channel."""
     _, _, idx_col, _ = _cols()
