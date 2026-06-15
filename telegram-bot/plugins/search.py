@@ -33,14 +33,12 @@ async def _get_results_url(bot, message_id: int) -> str:
         try:
             chat = await bot.get_chat(RESULTS_CHANNEL)
             _results_channel_username = getattr(chat, "username", None)
-            _results_channel_resolved = True   # only cache on success
+            _results_channel_resolved = True
         except Exception:
             _results_channel_username = None
-            # leave _results_channel_resolved = False so we retry next time
 
     if _results_channel_username:
         return f"https://t.me/{_results_channel_username}/{message_id}"
-    # Private channel — use numeric ID format
     numeric_id = str(RESULTS_CHANNEL).replace("-100", "")
     return f"https://t.me/c/{numeric_id}/{message_id}"
 
@@ -78,22 +76,32 @@ async def _auto_delete(no_res_msg, query_msg, delay: int = 60):
 # ---------------------------------------------------------------------------
 # Deduplication
 # ---------------------------------------------------------------------------
+#
+# Goal: collapse identical content posted in different qualities across
+# multiple channels (e.g. the same movie as 1080p BluRay and 720p WebRip).
+#
+# We deliberately KEEP season/episode numbers in the canonical key because
+# Season 1 and Season 2 are different content, not duplicates.
+# e.g. "Inspector Avinash Season 1" ≠ "Inspector Avinash Season 2"
+#
+# We strip only technical/quality/format tags that don't change the title:
+#   resolution (1080p, 4K …), codec (x265, HEVC …), container (mkv, mp4 …),
+#   source (BluRay, WEBRip …), audio codec (AAC, AC3 …), language labels
+#   (Hindi, Dubbed …), and editorial tags (Remastered, Extended …).
 
 _QUALITY_TAGS = re.compile(
     r'\b('
     r'2160p?|1080p?|720p?|480p?|360p?|'
-    r'4k|uhd|hdr10?|hlg|'
+    r'4k|uhd|hdr10?|hlg|dv|dolby\.?vision|'
     r'hdrip|bluray|blu.?ray|webrip|web.?dl|'
     r'dvdrip|hdtv|bdrip|hd.?cam|'
     r'x264|x265|h\.?264|h\.?265|avc|hevc|'
-    r'aac|ac3|dts|mp3|'
+    r'aac|ac3|dts|mp3|atmos|'
     r'mp4|mkv|avi|mov|wmv|flv|'
-    r'english|hindi|tamil|telugu|dubbed|'
-    r'sub(?:title(?:d)?)?|multi|'
-    r'extended|unrated|remastered|directors?.?cut|'
-    r'(?:season|s)\s*\d+|'
-    r'(?:episode|ep?)\s*\d+|'
-    r's\d{1,2}e\d{1,2}'
+    r'english|hindi|tamil|telugu|malayalam|kannada|punjabi|'
+    r'dubbed|dual\.?audio|multi|'
+    r'sub(?:title(?:d)?)?|'
+    r'extended|unrated|remastered|directors?.?cut|theatrical'
     r')\b',
     re.IGNORECASE,
 )
@@ -101,6 +109,7 @@ _YEAR_RE   = re.compile(r'\b(?:19|20)\d{2}\b')
 _NON_ALPHA = re.compile(r'[^a-z0-9\s]')
 _SPACES    = re.compile(r'\s+')
 
+# file_type priority: higher = prefer this hit over others in the same group
 _FILE_TYPE_RANK: dict[str, int] = {
     "video":     4,
     "document":  3,
@@ -112,6 +121,12 @@ MAX_FORWARD = 10
 
 
 def _canonical(text: str) -> str:
+    """
+    Normalise a title for deduplication grouping.
+
+    Strips: year, quality/format/language tags, punctuation.
+    Keeps:  season and episode numbers — Season 1 ≠ Season 2.
+    """
     t = text.lower()
     t = _YEAR_RE.sub(" ", t)
     t = _QUALITY_TAGS.sub(" ", t)
@@ -121,6 +136,12 @@ def _canonical(text: str) -> str:
 
 
 def _deduplicate(hits: list) -> list:
+    """
+    Group hits by canonical title, keep one best representative per group.
+
+    Best = highest file_type rank first; ties broken by most recent indexed_at.
+    Group order follows first occurrence, preserving search relevance.
+    """
     seen: dict[str, dict] = {}
     order: list[str] = []
 
@@ -182,7 +203,6 @@ async def search(bot, message):
     raw_hits = await search_index(channels, query, limit=MAX_RESULTS)
 
     if not raw_hits:
-        # Log miss so /trending can show what content is missing
         asyncio.create_task(log_search(query, user_id, message.chat.id, found=False))
         no_res = await message.reply(
             f"❌ <b>No results found for:</b> <i>{html.escape(query)}</i>\n\n"
@@ -191,10 +211,8 @@ async def search(bot, message):
         asyncio.create_task(_auto_delete(no_res, message, delay=60))
         return
 
-    # Log the search (fire-and-forget, never blocks the reply)
     asyncio.create_task(log_search(query, user_id, message.chat.id, found=True))
 
-    # Deduplicate — one best result per unique title
     unique_hits = _deduplicate(raw_hits)
     total_raw   = len(raw_hits)
     total_uniq  = len(unique_hits)
