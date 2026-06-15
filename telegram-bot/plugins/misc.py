@@ -1,8 +1,13 @@
+import html
 import logging
+from datetime import datetime, timezone
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import OWNER_ID, LOG_CHANNEL
-from database.db import add_group, get_group, add_user, get_groups, get_users, get_index_count
+from database.db import (
+    add_group, get_group, add_user, get_groups, get_users,
+    get_index_count, get_last_indexed_time,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,9 +29,27 @@ Just send any movie or series name in the group.
 /backfill -100xxx — index a specific channel
 /backfill all — index all channels across all groups
 /backfill stop — cancel a running backfill
+/status — index status per channel
 /stats — bot statistics (owner only)
 /ping — check if bot is alive
 """
+
+
+def _time_ago(dt: datetime) -> str:
+    """Return human-readable 'X ago' string from a UTC datetime."""
+    if not dt:
+        return "never"
+    now = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    diff = int((now - dt).total_seconds())
+    if diff < 60:
+        return f"{diff}s ago"
+    if diff < 3600:
+        return f"{diff // 60}m ago"
+    if diff < 86400:
+        return f"{diff // 3600}h ago"
+    return f"{diff // 86400}d ago"
 
 
 @Client.on_message(filters.command("start"))
@@ -73,6 +96,54 @@ async def help_cb(bot, update):
     await update.message.reply(START_TEXT)
 
 
+@Client.on_message(filters.command("status"))
+async def status_cmd(bot, message):
+    """
+    In a group: shows per-channel index count + last indexed time.
+    In PM or unregistered group: shows a summary prompt.
+    """
+    group = await get_group(message.chat.id)
+
+    if not group:
+        return await message.reply(
+            "⚠️ This group is not registered yet.\n"
+            "Use /start to register it first."
+        )
+
+    channels = group.get("channels", [])
+    if not channels:
+        return await message.reply(
+            "📭 No source channels connected.\n"
+            "Use: <code>/addsource add -100xxxxxxxxxx</code>"
+        )
+
+    lines = ["🤖 <b>Bot:</b> ✅ Connected\n", "<b>📊 Index Status</b>\n"]
+
+    total = 0
+    for ch_id in channels:
+        try:
+            chat = await bot.get_chat(ch_id)
+            name = html.escape(getattr(chat, "title", str(ch_id)))
+        except Exception:
+            name = str(ch_id)
+
+        count     = await get_index_count([ch_id])
+        last_dt   = await get_last_indexed_time(ch_id)
+        last_str  = _time_ago(last_dt)
+        total    += count
+
+        lines.append(
+            f"📡 <b>{name}</b>\n"
+            f"   └ {count:,} indexed | last: {last_str}"
+        )
+
+    lines.append(f"\n<b>Total:</b> {total:,} messages indexed")
+    if not any(await get_index_count([c]) > 0 for c in channels):
+        lines.append("\n💡 Run /backfill to index existing channel history.")
+
+    await message.reply("\n".join(lines))
+
+
 @Client.on_message(filters.command("stats") & filters.user(OWNER_ID))
 async def stats(bot, message):
     grp_count, _ = await get_groups()
@@ -82,7 +153,7 @@ async def stats(bot, message):
         f"📊 <b>Bot Statistics</b>\n\n"
         f"👥 Groups: <b>{grp_count}</b>\n"
         f"👤 Users: <b>{usr_count}</b>\n"
-        f"📦 Indexed messages: <b>{idx_count}</b>"
+        f"📦 Indexed messages: <b>{idx_count:,}</b>"
     )
 
 
