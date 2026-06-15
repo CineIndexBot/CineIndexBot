@@ -19,6 +19,27 @@ _EXCLUDED_COMMANDS = [
     "connections", "stats", "broadcast", "ping", "verify", "backfill",
 ]
 
+# Cache the results channel public username to build correct message links
+_results_channel_username: str | None = None
+_results_channel_resolved: bool = False
+
+
+async def _get_results_url(bot, message_id: int) -> str:
+    global _results_channel_username, _results_channel_resolved
+    if not _results_channel_resolved:
+        try:
+            chat = await bot.get_chat(RESULTS_CHANNEL)
+            _results_channel_username = getattr(chat, "username", None)
+        except Exception:
+            _results_channel_username = None
+        _results_channel_resolved = True
+
+    if _results_channel_username:
+        return f"https://t.me/{_results_channel_username}/{message_id}"
+    # Private channel — use numeric ID format
+    numeric_id = str(RESULTS_CHANNEL).replace("-100", "")
+    return f"https://t.me/c/{numeric_id}/{message_id}"
+
 
 async def _send_result(bot, result_chat: int, source_chat: int, message_id: int):
     """Forward a single indexed message to the results channel."""
@@ -66,7 +87,8 @@ async def search(bot, message):
     channels = group.get("channels", [])
     if not channels:
         return await message.reply(
-            "📭 No source channels connected.\n"
+            "📭 No source channels connected.
+"
             "Use: <code>/addsource add -100xxxxxxxxxx</code>"
         )
 
@@ -78,10 +100,11 @@ async def search(bot, message):
 
     if not hits:
         no_res = await message.reply(
-            f"❌ <b>No results found for:</b> <i>{html.escape(query)}</i>\n\n"
+            f"❌ <b>No results found for:</b> <i>{html.escape(query)}</i>
+
+"
             "Please request the group admin 👇"
         )
-        # Schedule auto-delete without blocking the handler
         asyncio.create_task(_auto_delete(no_res, message, delay=60))
         return
 
@@ -94,13 +117,12 @@ async def search(bot, message):
 
     if not sent_msgs:
         return await message.reply(
-            "⚠️ Found results but could not forward them.\n"
+            "⚠️ Found results but could not forward them.
+"
             "Make sure the bot is admin in the RESULTS_CHANNEL."
         )
 
-    # Link to first forwarded message in results channel
-    results_channel_id = str(RESULTS_CHANNEL).replace("-100", "")
-    first_url = f"https://t.me/c/{results_channel_id}/{sent_msgs[0].id}"
+    first_url = await _get_results_url(bot, sent_msgs[0].id)
 
     reply = await message.reply(
         f"🎬 <b>Found {len(sent_msgs)} result(s) for:</b> <i>{html.escape(query)}</i>",
@@ -109,7 +131,6 @@ async def search(bot, message):
         ]])
     )
 
-    # Schedule auto-delete for reply + query + forwarded results
     expire = time() + SEARCH_REPLY_TTL
     await save_dlt_message(reply, expire)
     await save_dlt_message(message, expire)
