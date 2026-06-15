@@ -1,6 +1,7 @@
+import re
 import logging
 from datetime import datetime
-from config import MONGO_URI, OWNER_ID
+from config import MONGO_URI
 from pymongo.errors import DuplicateKeyError
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -119,23 +120,31 @@ async def delete_index_message(chat_id: int, message_id: int):
 
 
 async def search_index(channels: list, query: str, limit: int = 50) -> list:
-    """Search indexed messages in the given channels for the query string."""
+    """
+    Search indexed messages in the given channels for the query string.
+    All words in the query must appear in either text or file_name.
+    Uses MongoDB string regex with $options:'i' (Motor-compatible, not Python re objects).
+    """
     _, _, idx_col, _ = _cols()
     if not channels:
         return []
-    q = query.lower().strip()
-    words = q.split()
-    # Build regex: all words must appear somewhere in text or file_name
-    import re
+
+    words = query.lower().strip().split()
+    if not words:
+        return []
+
+    # Each word must appear in text OR file_name.
+    # Use string-based regex with $options so Motor can serialize to BSON correctly.
     and_conditions = []
     for word in words:
-        pattern = re.compile(re.escape(word), re.IGNORECASE)
+        escaped = re.escape(word)
         and_conditions.append({
             "$or": [
-                {"text": {"$regex": pattern}},
-                {"file_name": {"$regex": pattern}},
+                {"text":      {"$regex": escaped, "$options": "i"}},
+                {"file_name": {"$regex": escaped, "$options": "i"}},
             ]
         })
+
     mongo_filter = {
         "chat_id": {"$in": channels},
         "$and": and_conditions,

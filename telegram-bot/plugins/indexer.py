@@ -12,14 +12,14 @@ def _extract(message: Message):
     """Pull text, file_name, file_id, file_type from any message."""
     text = (message.caption or message.text or "").strip()
     file_name = ""
-    file_id = None
+    file_id   = None
     file_type = None
 
     for attr in _MEDIA_TYPES:
         media = getattr(message, attr, None)
         if media:
             file_type = attr
-            file_id = getattr(media, "file_id", None)
+            file_id   = getattr(media, "file_id", None)
             file_name = getattr(media, "file_name", "") or ""
             break
 
@@ -31,9 +31,8 @@ async def index_channel_post(bot, message: Message):
     """Index every new post in channels where the bot is admin."""
     text, file_name, file_id, file_type = _extract(message)
 
-    combined = f"{text} {file_name}".strip()
-    if not combined:
-        return
+    if not f"{text} {file_name}".strip():
+        return  # Nothing searchable
 
     try:
         await index_message(
@@ -51,24 +50,24 @@ async def index_channel_post(bot, message: Message):
 
 @Client.on_edited_message(filters.channel & ~filters.service)
 async def reindex_edited(bot, message: Message):
-    """Re-index a channel post when it's edited."""
+    """Re-index a channel post when its caption/text is edited."""
     await index_channel_post(bot, message)
-
-
-@Client.on_message(filters.channel & filters.service)
-async def handle_deleted(bot, message: Message):
-    """Handle channel message deletion events."""
-    pass
 
 
 @Client.on_deleted_messages()
 async def remove_from_index(bot, messages):
-    """Remove deleted channel posts from the index."""
+    """
+    Remove deleted channel posts from the index.
+    Note: Telegram does not include chat info in deletion updates sent to bots,
+    so chat_id is unavailable here. We do a best-effort delete by message_id only
+    when chat_id is available (e.g. group deletions), and skip silently otherwise.
+    """
     for msg in messages:
+        chat_id = getattr(msg.chat, "id", None) if getattr(msg, "chat", None) else None
+        if not chat_id:
+            continue  # Can't delete without chat_id — skip
         try:
-            await delete_index_message(
-                chat_id=msg.chat.id if msg.chat else 0,
-                message_id=msg.id,
-            )
+            await delete_index_message(chat_id=chat_id, message_id=msg.id)
+            logger.debug("Removed from index: chat=%d msg=%d", chat_id, msg.id)
         except Exception as e:
-            logger.debug("Delete-index skip: %s", e)
+            logger.debug("Delete-index skip (chat=%s msg=%d): %s", chat_id, msg.id, e)
