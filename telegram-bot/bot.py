@@ -31,13 +31,12 @@ def _start_health_server():
 async def main():
     await create_indexes()
 
-    # Health server in background thread (stays up even during FloodWait)
+    # Health server stays up permanently (even during FloodWait sleep)
     t = threading.Thread(target=_start_health_server, daemon=True)
     t.start()
 
-    logger.info("Starting CineIndexBot (no SESSION required)...")
+    logger.info("Starting CineIndexBot...")
 
-    # Retry loop — handles Telegram FloodWait on bot login gracefully
     while True:
         try:
             async with Bot:
@@ -53,22 +52,29 @@ async def main():
                         await delete_task
                     except asyncio.CancelledError:
                         pass
-            break  # Clean exit
+            # Clean exit — stop retrying
+            break
 
         except FloodWait as e:
             wait = e.value + 10
             logger.warning(
-                "Telegram FloodWait on login: %ds required. "
-                "Sleeping %ds before retry — do NOT restart the service during this wait.",
+                "Telegram FloodWait %ds on login. Sleeping %ds then retrying...",
                 e.value, wait,
             )
+            # Ensure client is stopped before we sleep and retry
+            try:
+                await Bot.stop()
+            except Exception:
+                pass
             await asyncio.sleep(wait)
-            logger.info("FloodWait over — retrying login...")
+            logger.info("FloodWait over — retrying...")
 
         except Exception as e:
+            # For all other errors, exit and let Railway restart the whole process.
+            # This ensures a fresh client instance on restart and avoids
+            # "Client is already connected" from reusing a dirty client object.
             logger.exception("Bot crashed: %s", e)
-            logger.info("Restarting in 30s...")
-            await asyncio.sleep(30)
+            sys.exit(1)
 
 
 if __name__ == "__main__":
