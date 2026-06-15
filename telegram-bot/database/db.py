@@ -17,8 +17,6 @@ def _get_db():
             raise RuntimeError("MONGO_URI is not set.")
         _dbclient = AsyncIOMotorClient(
             MONGO_URI,
-            tlsAllowInvalidCertificates=True,
-            tlsAllowInvalidHostnames=True,
             serverSelectionTimeoutMS=15000,
         )
     return _dbclient["CineIndexBot"]
@@ -133,8 +131,6 @@ async def search_index(channels: list, query: str, limit: int = 50) -> list:
     if not words:
         return []
 
-    # Each word must appear in text OR file_name.
-    # Use string-based regex with $options so Motor can serialize to BSON correctly.
     and_conditions = []
     for word in words:
         escaped = re.escape(word)
