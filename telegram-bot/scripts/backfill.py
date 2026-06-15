@@ -49,7 +49,9 @@ from pyrogram.errors import FloodWait, ChatAdminRequired, ChannelPrivate
 from database.db import index_message, create_indexes, get_index_count
 from config import API_ID, API_HASH
 
-SESSION = os.environ.get("SESSION") or os.environ.get("SESSION_SECRET", "")
+# SESSION_SECRET is the Replit web session secret — NOT a Pyrogram session.
+# Only read SESSION here; never fall back to SESSION_SECRET.
+SESSION = os.environ.get("SESSION", "")
 
 _MEDIA_TYPES = ("document", "video", "audio", "animation", "voice", "video_note", "photo")
 
