@@ -13,7 +13,7 @@ from database.db import get_group, add_user, save_dlt_message, search_index, log
 
 logger = logging.getLogger(__name__)
 
-MAX_RESULTS = 20   # fetch more so dedup has enough to work with; we cap forwards at 10
+MAX_RESULTS = 20
 
 _EXCLUDED_COMMANDS = [
     "start", "help", "addsource", "connect", "disconnect",
@@ -21,8 +21,6 @@ _EXCLUDED_COMMANDS = [
     "status", "trending",
 ]
 
-# Cache the results channel public username to build correct message links.
-# Only cached on success — transient failures retry on next search.
 _results_channel_username: str | None = None
 _results_channel_resolved: bool = False
 
@@ -36,7 +34,6 @@ async def _get_results_url(bot, message_id: int) -> str:
             _results_channel_resolved = True
         except Exception:
             _results_channel_username = None
-
     if _results_channel_username:
         return f"https://t.me/{_results_channel_username}/{message_id}"
     numeric_id = str(RESULTS_CHANNEL).replace("-100", "")
@@ -44,7 +41,6 @@ async def _get_results_url(bot, message_id: int) -> str:
 
 
 async def _send_result(bot, result_chat: int, source_chat: int, message_id: int):
-    """Forward a single indexed message to the results channel."""
     try:
         return await bot.forward_messages(
             chat_id=result_chat,
@@ -64,7 +60,6 @@ async def _send_result(bot, result_chat: int, source_chat: int, message_id: int)
 
 
 async def _auto_delete(no_res_msg, query_msg, delay: int = 60):
-    """Delete no-results reply and the original query after delay seconds."""
     await asyncio.sleep(delay)
     for m in (no_res_msg, query_msg):
         try:
@@ -77,17 +72,16 @@ async def _auto_delete(no_res_msg, query_msg, delay: int = 60):
 # Deduplication
 # ---------------------------------------------------------------------------
 #
-# Goal: collapse identical content posted in different qualities across
-# multiple channels (e.g. the same movie as 1080p BluRay and 720p WebRip).
+# Strips quality/format/language tags only.
+# Keeps season/episode numbers — Season 1 ≠ Season 2.
 #
-# We deliberately KEEP season/episode numbers in the canonical key because
-# Season 1 and Season 2 are different content, not duplicates.
-# e.g. "Inspector Avinash Season 1" ≠ "Inspector Avinash Season 2"
+# BUG FIX: _canonical() previously ran on the full caption text, which
+# included Terabox URLs. Since URLs are unique per post, every canonical
+# key was unique and dedup never fired.
 #
-# We strip only technical/quality/format tags that don't change the title:
-#   resolution (1080p, 4K …), codec (x265, HEVC …), container (mkv, mp4 …),
-#   source (BluRay, WEBRip …), audio codec (AAC, AC3 …), language labels
-#   (Hindi, Dubbed …), and editorial tags (Remastered, Extended …).
+# Fix: extract just the title portion before normalising:
+#   - If text has a "TITLE : …" line → use the value after the colon
+#   - Otherwise → use only the first line (avoids URL noise)
 
 _QUALITY_TAGS = re.compile(
     r'\b('
@@ -109,7 +103,6 @@ _YEAR_RE   = re.compile(r'\b(?:19|20)\d{2}\b')
 _NON_ALPHA = re.compile(r'[^a-z0-9\s]')
 _SPACES    = re.compile(r'\s+')
 
-# file_type priority: higher = prefer this hit over others in the same group
 _FILE_TYPE_RANK: dict[str, int] = {
     "video":     4,
     "document":  3,
@@ -120,14 +113,46 @@ _FILE_TYPE_RANK: dict[str, int] = {
 MAX_FORWARD = 10
 
 
+def _extract_title(text: str) -> str:
+    """
+    Pull the title portion out of a caption for dedup keying.
+
+    Handles two formats:
+      1. Structured: "TITLE : Inspector Avinash Season 2 2026\nAUDIO : Hindi\n..."
+         → returns "Inspector Avinash Season 2 2026"
+      2. Plain filename/text: "Avengers.Endgame.2019.1080p.mkv"
+         → returns the first line only (avoids Terabox URL noise on subsequent lines)
+    """
+    lines = text.splitlines()
+    # Check first 5 lines for a "title :" pattern (text is stored lowercased)
+    for line in lines[:5]:
+        stripped = line.strip()
+        if stripped.startswith("title") and ":" in stripped:
+            _, _, title_part = stripped.partition(":")
+            title = title_part.strip()
+            if title:
+                return title
+    # Fallback: first non-empty line only
+    for line in lines:
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return text
+
+
 def _canonical(text: str) -> str:
     """
     Normalise a title for deduplication grouping.
 
-    Strips: year, quality/format/language tags, punctuation.
-    Keeps:  season and episode numbers — Season 1 ≠ Season 2.
+    1. Extract just the title portion (ignores URLs, episode links, etc.)
+    2. Strip year
+    3. Strip quality/format/language tags
+    4. Strip punctuation
+    5. Collapse whitespace
+
+    Keeps season numbers — Season 1 ≠ Season 2.
     """
-    t = text.lower()
+    t = _extract_title(text.lower().strip())
     t = _YEAR_RE.sub(" ", t)
     t = _QUALITY_TAGS.sub(" ", t)
     t = _NON_ALPHA.sub(" ", t)
@@ -138,9 +163,7 @@ def _canonical(text: str) -> str:
 def _deduplicate(hits: list) -> list:
     """
     Group hits by canonical title, keep one best representative per group.
-
-    Best = highest file_type rank first; ties broken by most recent indexed_at.
-    Group order follows first occurrence, preserving search relevance.
+    Best = highest file_type rank, then most recent indexed_at.
     """
     seen: dict[str, dict] = {}
     order: list[str] = []
@@ -199,7 +222,6 @@ async def search(bot, message):
     if message.from_user:
         await add_user(message.from_user.id, message.from_user.first_name)
 
-    # Search the MongoDB index
     raw_hits = await search_index(channels, query, limit=MAX_RESULTS)
 
     if not raw_hits:
@@ -216,8 +238,7 @@ async def search(bot, message):
     unique_hits = _deduplicate(raw_hits)
     total_raw   = len(raw_hits)
     total_uniq  = len(unique_hits)
-
-    to_forward = unique_hits[:MAX_FORWARD]
+    to_forward  = unique_hits[:MAX_FORWARD]
 
     sent_msgs = []
     for hit in to_forward:
