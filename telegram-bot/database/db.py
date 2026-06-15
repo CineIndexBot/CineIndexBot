@@ -33,6 +33,10 @@ def _search_col():
     return _get_db()["SEARCHES"]
 
 
+def _config_col():
+    return _get_db()["CONFIG"]
+
+
 # -- Groups -------------------------------------------------------------------
 
 async def add_group(group_id, group_name, user_id, channels=None):
@@ -193,12 +197,7 @@ def _normalize_query(q: str) -> str:
 
 
 async def log_search(query: str, user_id: int, chat_id: int, found: bool = True):
-    """
-    Record a search event.
-    - query_norm: normalized form used for aggregation grouping
-    - query: original text stored for display in /trending
-    - found: True if results were returned, False if no results
-    """
+    """Record a search event for trending analytics."""
     col = _search_col()
     try:
         await col.insert_one({
@@ -214,11 +213,7 @@ async def log_search(query: str, user_id: int, chat_id: int, found: bool = True)
 
 
 async def get_trending(limit: int = 10, days: int = 7) -> list[dict]:
-    """
-    Return top `limit` searches from the last `days` days.
-    Each entry: {"query": str, "count": int, "found_pct": int}
-    Grouped by query_norm; display label is the most-frequent raw query in that group.
-    """
+    """Return top `limit` searches from the last `days` days."""
     col = _search_col()
     since = datetime.utcnow() - timedelta(days=days)
 
@@ -226,10 +221,9 @@ async def get_trending(limit: int = 10, days: int = 7) -> list[dict]:
         {"$match": {"searched_at": {"$gte": since}}},
         {
             "$group": {
-                "_id":        "$query_norm",
-                "count":      {"$sum": 1},
-                "found_sum":  {"$sum": {"$cond": ["$found", 1, 0]}},
-                # collect raw queries to pick the most representative display label
+                "_id":         "$query_norm",
+                "count":       {"$sum": 1},
+                "found_sum":   {"$sum": {"$cond": ["$found", 1, 0]}},
                 "raw_queries": {"$push": "$query"},
             }
         },
@@ -238,22 +232,17 @@ async def get_trending(limit: int = 10, days: int = 7) -> list[dict]:
     ]
 
     results = await col.aggregate(pipeline).to_list(length=limit)
-
     out = []
     for r in results:
-        # Pick the most common raw query in this group as the display label
-        raws = r.get("raw_queries", [])
-        if raws:
-            label = max(set(raws), key=raws.count)
-            # Capitalise first letter for cleaner display
-            label = label[0].upper() + label[1:] if label else r["_id"]
-        else:
-            label = r["_id"]
-
-        count     = r["count"]
-        found_pct = round(r["found_sum"] * 100 / count) if count else 0
-        out.append({"query": label, "count": count, "found_pct": found_pct})
-
+        raws  = r.get("raw_queries", [])
+        label = max(set(raws), key=raws.count) if raws else r["_id"]
+        label = label[0].upper() + label[1:] if label else r["_id"]
+        count = r["count"]
+        out.append({
+            "query":     label,
+            "count":     count,
+            "found_pct": round(r["found_sum"] * 100 / count) if count else 0,
+        })
     return out
 
 
@@ -281,6 +270,25 @@ async def get_search_stats(days: int = 7) -> dict:
         "found_total": r["found_total"],
         "unique":      len(r.get("unique_norms", [])),
     }
+
+
+# -- Config (key-value store for bot state) -----------------------------------
+
+async def get_config(key: str):
+    """Retrieve a config value by key. Returns None if not set."""
+    col = _config_col()
+    doc = await col.find_one({"_id": key})
+    return doc["value"] if doc else None
+
+
+async def set_config(key: str, value):
+    """Upsert a config value."""
+    col = _config_col()
+    await col.update_one(
+        {"_id": key},
+        {"$set": {"value": value}},
+        upsert=True,
+    )
 
 
 # -- Auto-Delete --------------------------------------------------------------
