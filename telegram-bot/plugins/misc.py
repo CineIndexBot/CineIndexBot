@@ -7,6 +7,7 @@ from config import OWNER_ID, LOG_CHANNEL
 from database.db import (
     add_group, get_group, add_user, get_groups, get_users,
     get_index_count, get_last_indexed_time,
+    get_trending, get_search_stats,
 )
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,7 @@ Just send any movie or series name in the group.
 /backfill all — index all channels across all groups
 /backfill stop — cancel a running backfill
 /status — index status per channel
+/trending — top 10 searches this week
 /stats — bot statistics (owner only)
 /ping — check if bot is alive
 """
@@ -98,10 +100,6 @@ async def help_cb(bot, update):
 
 @Client.on_message(filters.command("status"))
 async def status_cmd(bot, message):
-    """
-    In a group: shows per-channel index count + last indexed time.
-    In PM or unregistered group: shows a summary prompt.
-    """
     group = await get_group(message.chat.id)
 
     if not group:
@@ -127,10 +125,10 @@ async def status_cmd(bot, message):
         except Exception:
             name = str(ch_id)
 
-        count     = await get_index_count([ch_id])
-        last_dt   = await get_last_indexed_time(ch_id)
-        last_str  = _time_ago(last_dt)
-        total    += count
+        count    = await get_index_count([ch_id])
+        last_dt  = await get_last_indexed_time(ch_id)
+        last_str = _time_ago(last_dt)
+        total   += count
 
         lines.append(
             f"📡 <b>{name}</b>\n"
@@ -144,16 +142,59 @@ async def status_cmd(bot, message):
     await message.reply("\n".join(lines))
 
 
+@Client.on_message(filters.command("trending"))
+async def trending_cmd(bot, message):
+    """Top 10 most-searched titles this week. Available to all group members."""
+    trending = await get_trending(limit=10, days=7)
+    stats    = await get_search_stats(days=7)
+
+    if not trending:
+        return await message.reply(
+            "📭 No search data yet this week.\n"
+            "Once users start searching, top titles will appear here."
+        )
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines  = ["🔥 <b>Top 10 Searches This Week</b>\n"]
+
+    for i, item in enumerate(trending, start=1):
+        prefix = medals[i - 1] if i <= 3 else f"{i}."
+        label  = html.escape(item["query"])
+        count  = item["count"]
+        pct    = item["found_pct"]
+        # Show a "no results" tag if the majority of searches came up empty
+        tag = " <i>(no results)</i>" if pct < 30 else ""
+        lines.append(f"{prefix} {label} — <b>{count}</b> search{'es' if count != 1 else ''}{tag}")
+
+    total   = stats["total"]
+    unique  = stats["unique"]
+    found   = stats["found_total"]
+    miss    = total - found
+    lines.append(
+        f"\n📊 {total:,} total searches | {unique:,} unique titles"
+    )
+    if miss:
+        lines.append(
+            f"❓ {miss:,} searches returned no results — consider adding those channels"
+        )
+
+    await message.reply("\n".join(lines))
+
+
 @Client.on_message(filters.command("stats") & filters.user(OWNER_ID))
 async def stats(bot, message):
     grp_count, _ = await get_groups()
     usr_count, _ = await get_users()
     idx_count    = await get_index_count()
+    week_stats   = await get_search_stats(days=7)
     await message.reply(
         f"📊 <b>Bot Statistics</b>\n\n"
         f"👥 Groups: <b>{grp_count}</b>\n"
         f"👤 Users: <b>{usr_count}</b>\n"
-        f"📦 Indexed messages: <b>{idx_count:,}</b>"
+        f"📦 Indexed messages: <b>{idx_count:,}</b>\n\n"
+        f"🔍 Searches this week: <b>{week_stats['total']:,}</b>\n"
+        f"🎯 With results: <b>{week_stats['found_total']:,}</b>\n"
+        f"❓ No results: <b>{week_stats['total'] - week_stats['found_total']:,}</b>"
     )
 
 
