@@ -54,18 +54,17 @@ async def reindex_edited(bot, message: Message):
     await index_channel_post(bot, message)
 
 
-@Client.on_deleted_messages()
+@Client.on_deleted_messages(filters.channel)
 async def remove_from_index(bot, messages):
     """
     Remove deleted channel posts from the index.
-    Note: Telegram does not include chat info in deletion updates sent to bots,
-    so chat_id is unavailable here. We do a best-effort delete by message_id only
-    when chat_id is available (e.g. group deletions), and skip silently otherwise.
+    Filtered to channels only — Telegram includes channel_id in
+    UpdateDeleteChannelMessages so chat info is reliably available.
     """
     for msg in messages:
         chat_id = getattr(msg.chat, "id", None) if getattr(msg, "chat", None) else None
         if not chat_id:
-            continue  # Can't delete without chat_id — skip
+            continue
         try:
             await delete_index_message(chat_id=chat_id, message_id=msg.id)
             logger.debug("Removed from index: chat=%d msg=%d", chat_id, msg.id)
