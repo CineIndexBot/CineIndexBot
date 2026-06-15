@@ -1,25 +1,14 @@
 """
-Backfill script — indexes existing messages from channels into MongoDB.
+Backfill script — indexes existing channel history using the bot itself.
 
-WHY THIS EXISTS:
-  The main bot only indexes NEW posts (messages sent after the bot was added
-  as admin). This script indexes OLD messages that were posted before setup.
+No SESSION or secondary account needed.
+The bot must be added as admin to the channel first.
 
-REQUIRES:
-  A SESSION string (Pyrogram user account) because Telegram bots cannot read
-  channel message history. This is a ONE-TIME script. The main bot never
-  needs SESSION after this runs.
-
-HOW TO RUN on Railway:
-  1. Go to your Railway service → Settings → "Run Command"
-  2. Paste:
-       SESSION="your_session_string" python telegram-bot/scripts/backfill.py -100xxxxxxxxxx
-  3. Or run multiple channels at once:
-       SESSION="..." python telegram-bot/scripts/backfill.py -100xxx1 -100xxx2 -100xxx3
+HOW TO RUN on Railway console:
+  python telegram-bot/scripts/backfill.py -100xxxxxxxxxx
 
 HOW TO RUN locally:
-  export SESSION="your_pyrogram_session_string"
-  export API_ID=...  API_HASH=...  MONGO_URI=...
+  export API_ID=...  API_HASH=...  BOT_TOKEN=...  MONGO_URI=...
   python scripts/backfill.py -100xxxxxxxxxx
 
 FLAGS:
@@ -47,11 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pyrogram import Client
 from pyrogram.errors import FloodWait, ChatAdminRequired, ChannelPrivate
 from database.db import index_message, create_indexes, get_index_count
-from config import API_ID, API_HASH
-
-# SESSION_SECRET is the Replit web session secret — NOT a Pyrogram session.
-# Only read SESSION here; never fall back to SESSION_SECRET.
-SESSION = os.environ.get("SESSION", "")
+from config import API_ID, API_HASH, BOT_TOKEN
 
 _MEDIA_TYPES = ("document", "video", "audio", "animation", "voice", "video_note", "photo")
 
@@ -82,15 +67,9 @@ def _fmt_time(seconds: float) -> str:
     return f"{h}h {m}m"
 
 
-async def backfill_channel(
-    user_client: Client,
-    channel_id: int,
-    limit: int = 0,
-    dry_run: bool = False,
-) -> int:
-    # Resolve channel name
+async def backfill_channel(bot, channel_id: int, limit: int = 0, dry_run: bool = False) -> int:
     try:
-        chat = await user_client.get_chat(channel_id)
+        chat = await bot.get_chat(channel_id)
         name = getattr(chat, "title", str(channel_id))
     except Exception:
         name = str(channel_id)
@@ -111,11 +90,9 @@ async def backfill_channel(
     last_log = start
 
     try:
-        async for message in user_client.get_chat_history(channel_id, limit=limit or 0):
+        async for message in bot.get_chat_history(channel_id, limit=limit or 0):
             text, file_name, file_id, file_type = _extract(message)
-            combined = f"{text} {file_name}".strip()
-
-            if not combined:
+            if not f"{text} {file_name}".strip():
                 skipped += 1
                 continue
 
@@ -130,16 +107,16 @@ async def backfill_channel(
                         file_name=file_name,
                     )
                 except Exception as e:
-                    logger.warning("  ⚠ Save error msg %d: %s", message.id, e)
+                    logger.warning("  Save error msg %d: %s", message.id, e)
                     continue
 
             count += 1
             now = time.time()
-            if now - last_log >= 10:     # progress every 10 seconds
+            if now - last_log >= 10:
                 elapsed = now - start
-                rate    = count / elapsed if elapsed > 0 else 0
+                rate = count / elapsed if elapsed > 0 else 0
                 logger.info(
-                    "  ↳ Indexed %d | Skipped %d | %.1f msg/s | Running %s",
+                    "  Indexed %d | Skipped %d | %.1f msg/s | %s",
                     count, skipped, rate, _fmt_time(elapsed),
                 )
                 last_log = now
@@ -148,26 +125,19 @@ async def backfill_channel(
         logger.warning("FloodWait %ds — sleeping...", e.value)
         await asyncio.sleep(e.value + 2)
     except ChatAdminRequired:
-        logger.error("❌ Not a member/admin of channel %d — skipping", channel_id)
+        logger.error("Not a member/admin of channel %d — make bot an admin first", channel_id)
         return 0
     except ChannelPrivate:
-        logger.error("❌ Channel %d is private and account is not a member — skipping", channel_id)
+        logger.error("Channel %d is private and bot is not a member", channel_id)
         return 0
 
     elapsed = time.time() - start
-    action  = "Counted" if dry_run else "Indexed"
+    action = "Counted" if dry_run else "Indexed"
     logger.info("✅ %s %d messages | Skipped %d | Time %s", action, count, skipped, _fmt_time(elapsed))
     return count
 
 
 async def main(channel_ids: list, limit: int, dry_run: bool):
-    if not SESSION:
-        print("\n❌  SESSION env var is required for backfill.")
-        print("    The main bot does NOT need SESSION — only this script does.")
-        print("\n    Set it like:")
-        print('    SESSION="your_pyrogram_session_string" python scripts/backfill.py -100xxx\n')
-        sys.exit(1)
-
     if not channel_ids:
         print("\nUsage: python scripts/backfill.py [-h] [--limit N] [--dry-run] channel_id [channel_id ...]")
         print("Example: python scripts/backfill.py -100123456789 -100987654321\n")
@@ -184,20 +154,20 @@ async def main(channel_ids: list, limit: int, dry_run: bool):
     print(f"{'='*50}\n")
 
     async with Client(
-        name="backfill_user",
-        session_string=SESSION,
+        name="backfill_bot",
         api_id=API_ID,
         api_hash=API_HASH,
+        bot_token=BOT_TOKEN,
         in_memory=True,
-    ) as user:
-        me = await user.get_me()
-        logger.info("✅ Signed in as: %s (%s)", me.first_name, me.phone_number)
+    ) as bot:
+        me = await bot.get_me()
+        logger.info("✅ Signed in as bot: @%s", me.username)
 
-        grand_total = 0
+        grand_total   = 0
         overall_start = time.time()
 
         for ch_id in channel_ids:
-            grand_total += await backfill_channel(user, ch_id, limit=limit, dry_run=dry_run)
+            grand_total += await backfill_channel(bot, ch_id, limit=limit, dry_run=dry_run)
 
         elapsed = time.time() - overall_start
         print(f"\n{'='*50}")
