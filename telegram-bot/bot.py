@@ -14,6 +14,7 @@ from pyrogram.errors import FloodWait
 from client import Bot
 from database.db import create_indexes
 from plugins.autodelete import auto_delete_loop
+from plugins.scheduler import scheduled_backfill_loop
 
 
 def _start_health_server():
@@ -43,16 +44,18 @@ async def main():
                 me = await Bot.get_me()
                 logger.info("Bot started: @%s", me.username)
 
-                delete_task = asyncio.create_task(auto_delete_loop(Bot))
+                delete_task    = asyncio.create_task(auto_delete_loop(Bot))
+                scheduler_task = asyncio.create_task(scheduled_backfill_loop(Bot))
+
                 try:
                     await asyncio.Event().wait()
                 finally:
-                    delete_task.cancel()
-                    try:
-                        await delete_task
-                    except asyncio.CancelledError:
-                        pass
-            # Clean exit — stop retrying
+                    for task in (delete_task, scheduler_task):
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
             break
 
         except FloodWait as e:
@@ -61,7 +64,6 @@ async def main():
                 "Telegram FloodWait %ds on login. Sleeping %ds then retrying...",
                 e.value, wait,
             )
-            # Ensure client is stopped before we sleep and retry
             try:
                 await Bot.stop()
             except Exception:
@@ -70,9 +72,6 @@ async def main():
             logger.info("FloodWait over — retrying...")
 
         except Exception as e:
-            # For all other errors, exit and let Railway restart the whole process.
-            # This ensures a fresh client instance on restart and avoids
-            # "Client is already connected" from reusing a dirty client object.
             logger.exception("Bot crashed: %s", e)
             sys.exit(1)
 
