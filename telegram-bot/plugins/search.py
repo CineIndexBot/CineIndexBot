@@ -9,7 +9,9 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait
 
 from config import RESULTS_CHANNEL, SEARCH_REPLY_TTL
-from database.db import get_group, add_user, save_dlt_message, search_index, log_search
+from database.db import (
+    get_group, add_user, save_dlt_message, search_index, log_search, log_request,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +20,7 @@ MAX_RESULTS = 20
 _EXCLUDED_COMMANDS = [
     "start", "help", "addsource", "connect", "disconnect",
     "connections", "stats", "broadcast", "ping", "verify", "backfill",
-    "status", "trending",
+    "status", "trending", "requests",
 ]
 
 _results_channel_username: str | None = None
@@ -71,17 +73,6 @@ async def _auto_delete(no_res_msg, query_msg, delay: int = 60):
 # ---------------------------------------------------------------------------
 # Deduplication
 # ---------------------------------------------------------------------------
-#
-# Strips quality/format/language tags only.
-# Keeps season/episode numbers — Season 1 ≠ Season 2.
-#
-# BUG FIX: _canonical() previously ran on the full caption text, which
-# included Terabox URLs. Since URLs are unique per post, every canonical
-# key was unique and dedup never fired.
-#
-# Fix: extract just the title portion before normalising:
-#   - If text has a "TITLE : …" line → use the value after the colon
-#   - Otherwise → use only the first line (avoids URL noise)
 
 _QUALITY_TAGS = re.compile(
     r'\b('
@@ -116,15 +107,9 @@ MAX_FORWARD = 10
 def _extract_title(text: str) -> str:
     """
     Pull the title portion out of a caption for dedup keying.
-
-    Handles two formats:
-      1. Structured: "TITLE : Inspector Avinash Season 2 2026\nAUDIO : Hindi\n..."
-         → returns "Inspector Avinash Season 2 2026"
-      2. Plain filename/text: "Avengers.Endgame.2019.1080p.mkv"
-         → returns the first line only (avoids Terabox URL noise on subsequent lines)
+    Handles "TITLE : Name" structured captions and plain filenames.
     """
     lines = text.splitlines()
-    # Check first 5 lines for a "title :" pattern (text is stored lowercased)
     for line in lines[:5]:
         stripped = line.strip()
         if stripped.startswith("title") and ":" in stripped:
@@ -132,7 +117,6 @@ def _extract_title(text: str) -> str:
             title = title_part.strip()
             if title:
                 return title
-    # Fallback: first non-empty line only
     for line in lines:
         stripped = line.strip()
         if stripped:
@@ -143,13 +127,7 @@ def _extract_title(text: str) -> str:
 def _canonical(text: str) -> str:
     """
     Normalise a title for deduplication grouping.
-
-    1. Extract just the title portion (ignores URLs, episode links, etc.)
-    2. Strip year
-    3. Strip quality/format/language tags
-    4. Strip punctuation
-    5. Collapse whitespace
-
+    Extracts title line first, then strips year/quality/punctuation.
     Keeps season numbers — Season 1 ≠ Season 2.
     """
     t = _extract_title(text.lower().strip())
@@ -161,22 +139,15 @@ def _canonical(text: str) -> str:
 
 
 def _deduplicate(hits: list) -> list:
-    """
-    Group hits by canonical title, keep one best representative per group.
-    Best = highest file_type rank, then most recent indexed_at.
-    """
     seen: dict[str, dict] = {}
     order: list[str] = []
-
     for hit in hits:
-        raw = (hit.get("file_name") or hit.get("text") or "").strip()
-        key = _canonical(raw)
+        raw  = (hit.get("file_name") or hit.get("text") or "").strip()
+        key  = _canonical(raw)
         if not key:
             key = f"__{hit['chat_id']}_{hit['message_id']}"
-
         rank     = _FILE_TYPE_RANK.get(hit.get("file_type") or "", 0)
         hit_time = hit.get("indexed_at")
-
         if key not in seen:
             seen[key] = hit
             order.append(key)
@@ -190,8 +161,38 @@ def _deduplicate(hits: list) -> list:
                 and hit_time > prev_time
             ):
                 seen[key] = hit
-
     return [seen[k] for k in order]
+
+
+# ---------------------------------------------------------------------------
+# Request button callback
+# ---------------------------------------------------------------------------
+
+@Client.on_callback_query(filters.regex(r"^req_"))
+async def request_cb(bot, update):
+    """User tapped [📥 Request This] on a no-results message."""
+    # callback_data = "req_{query}" (query is truncated to fit 64-byte limit)
+    query = update.data[4:].strip()  # strip "req_" prefix
+    if not query:
+        return await update.answer("Something went wrong.", show_alert=True)
+
+    user_id = update.from_user.id if update.from_user else 0
+    chat_id = update.message.chat.id if update.message else 0
+
+    is_new = await log_request(query, user_id, chat_id)
+
+    if is_new:
+        await update.answer(
+            "✅ Requested! The admin has been notified.\n"
+            "We'll try to add this content soon.",
+            show_alert=True,
+        )
+    else:
+        await update.answer(
+            "✅ Already on the request list!\n"
+            "You've already requested this title.",
+            show_alert=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -226,9 +227,16 @@ async def search(bot, message):
 
     if not raw_hits:
         asyncio.create_task(log_search(query, user_id, message.chat.id, found=False))
+
+        # Truncate query to fit "req_" + query within Telegram's 64-byte callback_data limit
+        cb_query = query[:59]
+
         no_res = await message.reply(
             f"❌ <b>No results found for:</b> <i>{html.escape(query)}</i>\n\n"
-            "Please request the group admin 👇"
+            "Tap below to request this content 👇",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📥 Request This", callback_data=f"req_{cb_query}")
+            ]])
         )
         asyncio.create_task(_auto_delete(no_res, message, delay=60))
         return
