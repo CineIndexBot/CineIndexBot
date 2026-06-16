@@ -169,6 +169,17 @@ async def get_last_indexed_time(chat_id: int):
     return doc["indexed_at"] if doc else None
 
 
+async def get_recent_messages(channels: list, limit: int = 10) -> list:
+    """Return the most recently indexed messages across the given channels."""
+    _, _, idx_col, _ = _cols()
+    if not channels:
+        return []
+    cursor = idx_col.find(
+        {"chat_id": {"$in": channels}}
+    ).sort("indexed_at", -1).limit(limit)
+    return await cursor.to_list(length=limit)
+
+
 async def delete_channel_index(chat_id: int):
     _, _, idx_col, _ = _cols()
     result = await idx_col.delete_many({"chat_id": chat_id})
@@ -278,7 +289,6 @@ async def get_scheduler_status() -> dict:
     """
     Returns scheduler state for /status and /stats display.
     Kept here (not in scheduler.py) to avoid cross-plugin imports in misc.py.
-    Returns {"last_run": datetime|None, "next_run": datetime|None}
     """
     from plugins.scheduler import CONFIG_KEY, INTERVAL
     last_run = await get_config(CONFIG_KEY)
@@ -292,9 +302,8 @@ async def get_scheduler_status() -> dict:
 
 async def log_request(query: str, user_id: int, chat_id: int) -> bool:
     """
-    Log a content request from a user.
-    Returns True if this is a new request from this user.
-    Returns False if this user already requested the same title (dedup per user).
+    Log a content request. Returns True if new, False if this user already
+    requested the same normalised title.
     """
     col  = _requests_col()
     norm = _normalize_query(query)
@@ -313,9 +322,7 @@ async def log_request(query: str, user_id: int, chat_id: int) -> bool:
 
 
 async def get_requests(limit: int = 25, fulfilled: bool = False) -> list[dict]:
-    """
-    Return top content requests grouped by normalized query, sorted by count.
-    """
+    """Top content requests grouped by normalised query, sorted by count."""
     col = _requests_col()
     pipeline = [
         {"$match": {"fulfilled": fulfilled}},
@@ -344,10 +351,7 @@ async def get_requests(limit: int = 25, fulfilled: bool = False) -> list[dict]:
 
 
 async def fulfill_request(query_norm: str) -> int:
-    """
-    Mark all pending requests for a normalised query as fulfilled.
-    Returns the count of documents updated.
-    """
+    """Mark all pending requests for a normalised query as fulfilled."""
     col    = _requests_col()
     result = await col.update_many(
         {"query_norm": query_norm, "fulfilled": False},
@@ -357,7 +361,7 @@ async def fulfill_request(query_norm: str) -> int:
 
 
 async def get_request_count(fulfilled: bool = False) -> int:
-    """Count pending (or fulfilled) requests (unique titles)."""
+    """Count unique pending (or fulfilled) titles."""
     col = _requests_col()
     pipeline = [
         {"$match": {"fulfilled": fulfilled}},
@@ -400,6 +404,7 @@ async def create_indexes():
         req_col  = _requests_col()
         await idx_col.create_index([("chat_id", 1), ("message_id", 1)], unique=True)
         await idx_col.create_index([("chat_id", 1), ("indexed_at", -1)])
+        await idx_col.create_index("indexed_at")
         await dlt_col.create_index("time")
         await srch_col.create_index("searched_at")
         await srch_col.create_index("query_norm")
