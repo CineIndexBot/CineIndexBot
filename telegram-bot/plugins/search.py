@@ -20,7 +20,7 @@ MAX_RESULTS = 20
 _EXCLUDED_COMMANDS = [
     "start", "help", "addsource", "connect", "disconnect",
     "connections", "stats", "broadcast", "ping", "verify", "backfill",
-    "status", "trending", "requests",
+    "status", "trending", "requests", "recent",
 ]
 
 _results_channel_username: str | None = None
@@ -171,8 +171,7 @@ def _deduplicate(hits: list) -> list:
 @Client.on_callback_query(filters.regex(r"^req_"))
 async def request_cb(bot, update):
     """User tapped [📥 Request This] on a no-results message."""
-    # callback_data = "req_{query}" (query is truncated to fit 64-byte limit)
-    query = update.data[4:].strip()  # strip "req_" prefix
+    query = update.data[4:].strip()
     if not query:
         return await update.answer("Something went wrong.", show_alert=True)
 
@@ -227,10 +226,7 @@ async def search(bot, message):
 
     if not raw_hits:
         asyncio.create_task(log_search(query, user_id, message.chat.id, found=False))
-
-        # Truncate query to fit "req_" + query within Telegram's 64-byte callback_data limit
         cb_query = query[:59]
-
         no_res = await message.reply(
             f"❌ <b>No results found for:</b> <i>{html.escape(query)}</i>\n\n"
             "Tap below to request this content 👇",
