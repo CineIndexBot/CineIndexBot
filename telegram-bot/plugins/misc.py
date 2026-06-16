@@ -1,14 +1,19 @@
 import html
 import logging
 from datetime import datetime, timezone
+from time import time
+
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from config import OWNER_ID, LOG_CHANNEL
+from pyrogram.errors import FloodWait
+
+from config import OWNER_ID, LOG_CHANNEL, RESULTS_CHANNEL, SEARCH_REPLY_TTL
 from database.db import (
     add_group, get_group, add_user, get_groups, get_users,
     get_index_count, get_last_indexed_time,
     get_trending, get_search_stats, get_scheduler_status,
     get_requests, fulfill_request, get_request_count,
+    get_recent_messages, save_dlt_message,
 )
 
 logger = logging.getLogger(__name__)
@@ -31,12 +36,32 @@ Just send any movie or series name in the group.
 /backfill -100xxx — index a specific channel
 /backfill all — index all channels across all groups
 /backfill stop — cancel a running backfill
+/recent — browse the 10 most recently added posts
 /status — index status + scheduled reindex info
 /trending — top 10 searches this week
 /requests — pending content requests (owner only)
 /stats — bot statistics (owner only)
 /ping — check if bot is alive
 """
+
+# Cache RESULTS_CHANNEL username for link building (shared with /recent)
+_rc_username: str | None = None
+_rc_resolved: bool = False
+
+
+async def _get_results_url(bot, message_id: int) -> str:
+    global _rc_username, _rc_resolved
+    if not _rc_resolved:
+        try:
+            chat = await bot.get_chat(RESULTS_CHANNEL)
+            _rc_username = getattr(chat, "username", None)
+            _rc_resolved = True
+        except Exception:
+            _rc_username = None
+    if _rc_username:
+        return f"https://t.me/{_rc_username}/{message_id}"
+    numeric_id = str(RESULTS_CHANNEL).replace("-100", "")
+    return f"https://t.me/c/{numeric_id}/{message_id}"
 
 
 def _time_ago(dt: datetime) -> str:
@@ -69,6 +94,24 @@ def _time_until(dt: datetime) -> str:
     if diff < 86400:
         return f"in {diff // 3600}h {(diff % 3600) // 60}m"
     return f"in {diff // 86400}d {(diff % 86400) // 3600}h"
+
+
+def _extract_title_from_stored(text: str) -> str:
+    """
+    Extract a readable title from stored (lowercased) caption text.
+    Handles the channel's "TITLE : name" structured format.
+    Falls back to the first non-empty line.
+    """
+    lines = text.splitlines()
+    for line in lines[:5]:
+        s = line.strip()
+        if s.startswith("title") and ":" in s:
+            _, _, part = s.partition(":")
+            t = part.strip()
+            # Re-capitalise: "inspector avinash season 2" → "Inspector Avinash Season 2"
+            return t.title()[:60] if t else ""
+    first = lines[0].strip() if lines else text.strip()
+    return first.title()[:60]
 
 
 @Client.on_message(filters.command("start"))
@@ -118,7 +161,6 @@ async def help_cb(bot, update):
 @Client.on_message(filters.command("status"))
 async def status_cmd(bot, message):
     group = await get_group(message.chat.id)
-
     if not group:
         return await message.reply(
             "⚠️ This group is not registered yet.\n"
@@ -141,12 +183,10 @@ async def status_cmd(bot, message):
             name = html.escape(getattr(chat, "title", str(ch_id)))
         except Exception:
             name = str(ch_id)
-
         count    = await get_index_count([ch_id])
         last_dt  = await get_last_indexed_time(ch_id)
         last_str = _time_ago(last_dt)
         total   += count
-
         lines.append(
             f"📡 <b>{name}</b>\n"
             f"   └ {count:,} indexed | last: {last_str}"
@@ -165,12 +205,108 @@ async def status_cmd(bot, message):
     else:
         lines.append("\n🔄 <b>Auto-reindex:</b> first run in ~5 min")
 
-    # Show pending request count if any
     req_count = await get_request_count()
     if req_count:
         lines.append(f"\n📋 <b>Pending requests:</b> {req_count} title(s) — use /requests")
 
     await message.reply("\n".join(lines))
+
+
+@Client.on_message(filters.command("recent"))
+async def recent_cmd(bot, message):
+    """Show the 10 most recently indexed posts across all connected channels."""
+    group = await get_group(message.chat.id)
+    if not group:
+        return await message.reply(
+            "⚠️ This group is not registered.\nUse /start first."
+        )
+
+    channels = group.get("channels", [])
+    if not channels:
+        return await message.reply(
+            "📭 No source channels connected.\n"
+            "Use: <code>/addsource add -100xxxxxxxxxx</code>"
+        )
+
+    hits = await get_recent_messages(channels, limit=10)
+    if not hits:
+        return await message.reply(
+            "📭 Nothing indexed yet.\n"
+            "Run /backfill to index existing channel history."
+        )
+
+    # Resolve channel names (cache per invocation)
+    ch_names: dict[int, str] = {}
+    for ch_id in {h["chat_id"] for h in hits}:
+        try:
+            chat = await bot.get_chat(ch_id)
+            ch_names[ch_id] = html.escape(getattr(chat, "title", str(ch_id)))
+        except Exception:
+            ch_names[ch_id] = str(ch_id)
+
+    # Forward all hits to RESULTS_CHANNEL
+    sent_msgs = []
+    for hit in hits:
+        try:
+            fwd = await bot.forward_messages(
+                chat_id=RESULTS_CHANNEL,
+                from_chat_id=hit["chat_id"],
+                message_ids=hit["message_id"],
+            )
+            sent_msgs.append((hit, fwd))
+        except FloodWait as e:
+            import asyncio
+            await asyncio.sleep(e.value + 1)
+            try:
+                fwd = await bot.forward_messages(
+                    chat_id=RESULTS_CHANNEL,
+                    from_chat_id=hit["chat_id"],
+                    message_ids=hit["message_id"],
+                )
+                sent_msgs.append((hit, fwd))
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning("recent: forward failed chat=%d msg=%d: %s",
+                           hit["chat_id"], hit["message_id"], e)
+
+    if not sent_msgs:
+        return await message.reply(
+            "⚠️ Could not forward results.\n"
+            "Make sure the bot is admin in RESULTS_CHANNEL."
+        )
+
+    # Build preview list grouped by channel
+    lines   = ["🆕 <b>New Arrivals</b>\n"]
+    prev_ch = None
+    for i, (hit, _fwd) in enumerate(sent_msgs, 1):
+        ch_id = hit["chat_id"]
+        raw   = (hit.get("text") or hit.get("file_name") or "").strip()
+        title = _extract_title_from_stored(raw) or f"Post #{hit['message_id']}"
+        age   = _time_ago(hit.get("indexed_at"))
+
+        if ch_id != prev_ch:
+            lines.append(f"\n📡 <b>{ch_names[ch_id]}</b>")
+            prev_ch = ch_id
+
+        lines.append(f"{i}. {html.escape(title)} — <i>{age}</i>")
+
+    lines.append(f"\n<i>{len(sent_msgs)} post(s) forwarded to results channel</i>")
+
+    first_url = await _get_results_url(bot, sent_msgs[0][1].id)
+    reply = await message.reply(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("📥 See New Arrivals →", url=first_url)
+        ]])
+    )
+
+    # Auto-delete reply + forwarded messages after TTL
+    expire = time() + SEARCH_REPLY_TTL
+    await save_dlt_message(reply, expire)
+    await save_dlt_message(message, expire)
+    for _hit, fwd in sent_msgs:
+        await save_dlt_message(fwd, expire)
 
 
 @Client.on_message(filters.command("trending"))
@@ -210,10 +346,6 @@ async def trending_cmd(bot, message):
 
 @Client.on_message(filters.command("requests") & filters.user(OWNER_ID))
 async def requests_cmd(bot, message):
-    """
-    /requests         — show top pending requests
-    /requests done    — show fulfilled requests
-    """
     args      = message.command[1:]
     show_done = args and args[0].lower() in ("done", "fulfilled")
     fulfilled = show_done
@@ -243,7 +375,6 @@ async def requests_cmd(bot, message):
             f"   └ {count} request{'s' if count != 1 else ''} | last: {age}"
         )
         if not fulfilled:
-            # Truncate query_norm to fit "rfulfill_" (9 chars) + norm within 64-byte limit
             cb_norm = item["query_norm"][:54]
             buttons.append([InlineKeyboardButton(
                 f"✅ {item['query'][:30]}",
@@ -253,9 +384,9 @@ async def requests_cmd(bot, message):
     if not fulfilled and total > 0:
         lines.append(f"\n<i>Tap ✅ to mark a title as added to your channel.</i>")
 
-    toggle_text = "📋 Show Pending" if fulfilled else "✅ Show Fulfilled"
-    toggle_cmd  = "/requests" if fulfilled else "/requests done"
-    lines.append(f"\n<i>{toggle_text}: {toggle_cmd}</i>")
+    toggle_cmd = "/requests" if fulfilled else "/requests done"
+    toggle_lbl = "📋 Show Pending" if fulfilled else "✅ Show Fulfilled"
+    lines.append(f"\n<i>{toggle_lbl}: <code>{toggle_cmd}</code></i>")
 
     await message.reply(
         "\n".join(lines),
@@ -265,8 +396,7 @@ async def requests_cmd(bot, message):
 
 @Client.on_callback_query(filters.regex(r"^rfulfill_") & filters.user(OWNER_ID))
 async def fulfill_cb(bot, update):
-    """Owner tapped ✅ on a request — mark it fulfilled."""
-    query_norm = update.data[9:]  # strip "rfulfill_"
+    query_norm = update.data[9:]
     if not query_norm:
         return await update.answer("Invalid.", show_alert=True)
 
@@ -279,7 +409,6 @@ async def fulfill_cb(bot, update):
     else:
         await update.answer("Already fulfilled or not found.", show_alert=True)
 
-    # Refresh the /requests list in the same message
     items = await get_requests(limit=20, fulfilled=False)
     total = await get_request_count(fulfilled=False)
 
@@ -309,7 +438,6 @@ async def fulfill_cb(bot, update):
             f"✅ {item['query'][:30]}",
             callback_data=f"rfulfill_{cb_norm}",
         )])
-
     lines.append(f"\n<i>Tap ✅ to mark a title as added to your channel.</i>")
 
     try:
