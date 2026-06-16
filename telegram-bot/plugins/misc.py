@@ -8,6 +8,7 @@ from database.db import (
     add_group, get_group, add_user, get_groups, get_users,
     get_index_count, get_last_indexed_time,
     get_trending, get_search_stats, get_scheduler_status,
+    get_requests, fulfill_request, get_request_count,
 )
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,7 @@ Just send any movie or series name in the group.
 /backfill stop — cancel a running backfill
 /status — index status + scheduled reindex info
 /trending — top 10 searches this week
+/requests — pending content requests (owner only)
 /stats — bot statistics (owner only)
 /ping — check if bot is alive
 """
@@ -152,13 +154,9 @@ async def status_cmd(bot, message):
 
     lines.append(f"\n<b>Total:</b> {total:,} messages indexed")
 
-    # BUG FIX: was `any(await get_index_count([c]) > 0 for c in channels)`
-    # which uses await inside a sync generator — TypeError at runtime.
-    # total is already computed above, so just check it directly.
     if total == 0:
         lines.append("\n💡 Run /backfill to index existing channel history.")
 
-    # Scheduled reindex info — get_scheduler_status is now in db.py (no cross-plugin import)
     sched = await get_scheduler_status()
     if sched["next_run"]:
         last_str = _time_ago(sched["last_run"]) if sched["last_run"] else "never"
@@ -166,6 +164,11 @@ async def status_cmd(bot, message):
         lines.append(f"\n🔄 <b>Auto-reindex:</b> last {last_str} | next {next_str}")
     else:
         lines.append("\n🔄 <b>Auto-reindex:</b> first run in ~5 min")
+
+    # Show pending request count if any
+    req_count = await get_request_count()
+    if req_count:
+        lines.append(f"\n📋 <b>Pending requests:</b> {req_count} title(s) — use /requests")
 
     await message.reply("\n".join(lines))
 
@@ -205,6 +208,119 @@ async def trending_cmd(bot, message):
     await message.reply("\n".join(lines))
 
 
+@Client.on_message(filters.command("requests") & filters.user(OWNER_ID))
+async def requests_cmd(bot, message):
+    """
+    /requests         — show top pending requests
+    /requests done    — show fulfilled requests
+    """
+    args      = message.command[1:]
+    show_done = args and args[0].lower() in ("done", "fulfilled")
+    fulfilled = show_done
+
+    items = await get_requests(limit=20, fulfilled=fulfilled)
+    total = await get_request_count(fulfilled=fulfilled)
+
+    if not items:
+        if fulfilled:
+            return await message.reply("📭 No fulfilled requests yet.")
+        return await message.reply(
+            "📭 No pending content requests yet.\n\n"
+            "When users search and get no results, they can tap\n"
+            "<b>[📥 Request This]</b> to add a request here."
+        )
+
+    heading = "✅ Fulfilled Requests" if fulfilled else "📋 Pending Content Requests"
+    lines   = [f"<b>{heading}</b>  ({total} unique title{'s' if total != 1 else ''})\n"]
+
+    buttons = []
+    for i, item in enumerate(items, 1):
+        label = html.escape(item["query"])
+        count = item["count"]
+        age   = _time_ago(item["latest"])
+        lines.append(
+            f"{i}. <b>{label}</b>\n"
+            f"   └ {count} request{'s' if count != 1 else ''} | last: {age}"
+        )
+        if not fulfilled:
+            # Truncate query_norm to fit "rfulfill_" (9 chars) + norm within 64-byte limit
+            cb_norm = item["query_norm"][:54]
+            buttons.append([InlineKeyboardButton(
+                f"✅ {item['query'][:30]}",
+                callback_data=f"rfulfill_{cb_norm}",
+            )])
+
+    if not fulfilled and total > 0:
+        lines.append(f"\n<i>Tap ✅ to mark a title as added to your channel.</i>")
+
+    toggle_text = "📋 Show Pending" if fulfilled else "✅ Show Fulfilled"
+    toggle_cmd  = "/requests" if fulfilled else "/requests done"
+    lines.append(f"\n<i>{toggle_text}: {toggle_cmd}</i>")
+
+    await message.reply(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
+    )
+
+
+@Client.on_callback_query(filters.regex(r"^rfulfill_") & filters.user(OWNER_ID))
+async def fulfill_cb(bot, update):
+    """Owner tapped ✅ on a request — mark it fulfilled."""
+    query_norm = update.data[9:]  # strip "rfulfill_"
+    if not query_norm:
+        return await update.answer("Invalid.", show_alert=True)
+
+    count = await fulfill_request(query_norm)
+    if count:
+        await update.answer(
+            f"✅ Marked as fulfilled ({count} request{'s' if count != 1 else ''} cleared).",
+            show_alert=True,
+        )
+    else:
+        await update.answer("Already fulfilled or not found.", show_alert=True)
+
+    # Refresh the /requests list in the same message
+    items = await get_requests(limit=20, fulfilled=False)
+    total = await get_request_count(fulfilled=False)
+
+    if not items:
+        try:
+            await update.message.edit(
+                "📋 <b>Pending Content Requests</b>\n\n"
+                "✅ All caught up — no pending requests!",
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+        return
+
+    lines   = [f"<b>📋 Pending Content Requests</b>  ({total} unique title{'s' if total != 1 else ''})\n"]
+    buttons = []
+    for i, item in enumerate(items, 1):
+        label = html.escape(item["query"])
+        cnt   = item["count"]
+        age   = _time_ago(item["latest"])
+        lines.append(
+            f"{i}. <b>{label}</b>\n"
+            f"   └ {cnt} request{'s' if cnt != 1 else ''} | last: {age}"
+        )
+        cb_norm = item["query_norm"][:54]
+        buttons.append([InlineKeyboardButton(
+            f"✅ {item['query'][:30]}",
+            callback_data=f"rfulfill_{cb_norm}",
+        )])
+
+    lines.append(f"\n<i>Tap ✅ to mark a title as added to your channel.</i>")
+
+    try:
+        await update.message.edit(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+    except Exception:
+        pass
+
+
 @Client.on_message(filters.command("stats") & filters.user(OWNER_ID))
 async def stats(bot, message):
     grp_count, _ = await get_groups()
@@ -212,6 +328,8 @@ async def stats(bot, message):
     idx_count    = await get_index_count()
     week_stats   = await get_search_stats(days=7)
     sched        = await get_scheduler_status()
+    req_pending  = await get_request_count(fulfilled=False)
+    req_done     = await get_request_count(fulfilled=True)
 
     sched_line = (
         f"\n🔄 Last auto-reindex: <b>{_time_ago(sched['last_run'])}</b>"
@@ -226,7 +344,9 @@ async def stats(bot, message):
         f"{sched_line}\n\n"
         f"🔍 Searches this week: <b>{week_stats['total']:,}</b>\n"
         f"🎯 With results: <b>{week_stats['found_total']:,}</b>\n"
-        f"❓ No results: <b>{week_stats['total'] - week_stats['found_total']:,}</b>"
+        f"❓ No results: <b>{week_stats['total'] - week_stats['found_total']:,}</b>\n\n"
+        f"📋 Pending requests: <b>{req_pending}</b> title(s)\n"
+        f"✅ Fulfilled requests: <b>{req_done}</b> title(s)"
     )
 
 
