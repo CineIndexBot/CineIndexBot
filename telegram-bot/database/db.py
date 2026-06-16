@@ -37,6 +37,10 @@ def _config_col():
     return _get_db()["CONFIG"]
 
 
+def _requests_col():
+    return _get_db()["REQUESTS"]
+
+
 # -- Groups -------------------------------------------------------------------
 
 async def add_group(group_id, group_name, user_id, channels=None):
@@ -284,6 +288,86 @@ async def get_scheduler_status() -> dict:
     return {"last_run": last_run, "next_run": next_run}
 
 
+# -- Content Requests ---------------------------------------------------------
+
+async def log_request(query: str, user_id: int, chat_id: int) -> bool:
+    """
+    Log a content request from a user.
+    Returns True if this is a new request from this user.
+    Returns False if this user already requested the same title (dedup per user).
+    """
+    col  = _requests_col()
+    norm = _normalize_query(query)
+    existing = await col.find_one({"query_norm": norm, "user_id": user_id, "fulfilled": False})
+    if existing:
+        return False
+    await col.insert_one({
+        "query":        query.strip(),
+        "query_norm":   norm,
+        "user_id":      user_id,
+        "chat_id":      chat_id,
+        "requested_at": datetime.utcnow(),
+        "fulfilled":    False,
+    })
+    return True
+
+
+async def get_requests(limit: int = 25, fulfilled: bool = False) -> list[dict]:
+    """
+    Return top content requests grouped by normalized query, sorted by count.
+    """
+    col = _requests_col()
+    pipeline = [
+        {"$match": {"fulfilled": fulfilled}},
+        {"$group": {
+            "_id":         "$query_norm",
+            "count":       {"$sum": 1},
+            "raw_queries": {"$push": "$query"},
+            "latest":      {"$max": "$requested_at"},
+        }},
+        {"$sort": {"count": -1, "latest": -1}},
+        {"$limit": limit},
+    ]
+    results = await col.aggregate(pipeline).to_list(length=limit)
+    out = []
+    for r in results:
+        raws  = r.get("raw_queries", [])
+        label = max(set(raws), key=raws.count) if raws else r["_id"]
+        label = label[0].upper() + label[1:] if label else r["_id"]
+        out.append({
+            "query":      label,
+            "query_norm": r["_id"],
+            "count":      r["count"],
+            "latest":     r["latest"],
+        })
+    return out
+
+
+async def fulfill_request(query_norm: str) -> int:
+    """
+    Mark all pending requests for a normalised query as fulfilled.
+    Returns the count of documents updated.
+    """
+    col    = _requests_col()
+    result = await col.update_many(
+        {"query_norm": query_norm, "fulfilled": False},
+        {"$set": {"fulfilled": True, "fulfilled_at": datetime.utcnow()}},
+    )
+    return result.modified_count
+
+
+async def get_request_count(fulfilled: bool = False) -> int:
+    """Count pending (or fulfilled) requests (unique titles)."""
+    col = _requests_col()
+    pipeline = [
+        {"$match": {"fulfilled": fulfilled}},
+        {"$group": {"_id": "$query_norm"}},
+        {"$count": "total"},
+    ]
+    res = await col.aggregate(pipeline).to_list(length=1)
+    return res[0]["total"] if res else 0
+
+
 # -- Auto-Delete --------------------------------------------------------------
 
 async def save_dlt_message(message, time):
@@ -313,11 +397,15 @@ async def create_indexes():
     try:
         _, _, idx_col, dlt_col = _cols()
         srch_col = _search_col()
+        req_col  = _requests_col()
         await idx_col.create_index([("chat_id", 1), ("message_id", 1)], unique=True)
         await idx_col.create_index([("chat_id", 1), ("indexed_at", -1)])
         await dlt_col.create_index("time")
         await srch_col.create_index("searched_at")
         await srch_col.create_index("query_norm")
+        await req_col.create_index([("query_norm", 1), ("user_id", 1)])
+        await req_col.create_index("fulfilled")
+        await req_col.create_index("requested_at")
         logger.info("Database indexes OK")
     except Exception as e:
         logger.warning("Index warning: %s", e)
