@@ -1,3 +1,4 @@
+import asyncio
 import html
 import logging
 from datetime import datetime, timezone
@@ -40,11 +41,11 @@ Just send any movie or series name in the group.
 /status — index status + scheduled reindex info
 /trending — top 10 searches this week
 /requests — pending content requests (owner only)
+/broadcast ‹msg› — send announcement to all groups (owner only)
 /stats — bot statistics (owner only)
 /ping — check if bot is alive
 """
 
-# Cache RESULTS_CHANNEL username for link building (shared with /recent)
 _rc_username: str | None = None
 _rc_resolved: bool = False
 
@@ -97,22 +98,20 @@ def _time_until(dt: datetime) -> str:
 
 
 def _extract_title_from_stored(text: str) -> str:
-    """
-    Extract a readable title from stored (lowercased) caption text.
-    Handles the channel's "TITLE : name" structured format.
-    Falls back to the first non-empty line.
-    """
     lines = text.splitlines()
     for line in lines[:5]:
         s = line.strip()
         if s.startswith("title") and ":" in s:
             _, _, part = s.partition(":")
             t = part.strip()
-            # Re-capitalise: "inspector avinash season 2" → "Inspector Avinash Season 2"
             return t.title()[:60] if t else ""
     first = lines[0].strip() if lines else text.strip()
     return first.title()[:60]
 
+
+# ---------------------------------------------------------------------------
+# /start  /help
+# ---------------------------------------------------------------------------
 
 @Client.on_message(filters.command("start"))
 async def start(bot, message):
@@ -157,6 +156,10 @@ async def help_cb(bot, update):
     await update.answer()
     await update.message.reply(START_TEXT)
 
+
+# ---------------------------------------------------------------------------
+# /status
+# ---------------------------------------------------------------------------
 
 @Client.on_message(filters.command("status"))
 async def status_cmd(bot, message):
@@ -212,9 +215,12 @@ async def status_cmd(bot, message):
     await message.reply("\n".join(lines))
 
 
+# ---------------------------------------------------------------------------
+# /recent
+# ---------------------------------------------------------------------------
+
 @Client.on_message(filters.command("recent"))
 async def recent_cmd(bot, message):
-    """Show the 10 most recently indexed posts across all connected channels."""
     group = await get_group(message.chat.id)
     if not group:
         return await message.reply(
@@ -235,7 +241,6 @@ async def recent_cmd(bot, message):
             "Run /backfill to index existing channel history."
         )
 
-    # Resolve channel names (cache per invocation)
     ch_names: dict[int, str] = {}
     for ch_id in {h["chat_id"] for h in hits}:
         try:
@@ -244,7 +249,6 @@ async def recent_cmd(bot, message):
         except Exception:
             ch_names[ch_id] = str(ch_id)
 
-    # Forward all hits to RESULTS_CHANNEL
     sent_msgs = []
     for hit in hits:
         try:
@@ -255,7 +259,6 @@ async def recent_cmd(bot, message):
             )
             sent_msgs.append((hit, fwd))
         except FloodWait as e:
-            import asyncio
             await asyncio.sleep(e.value + 1)
             try:
                 fwd = await bot.forward_messages(
@@ -276,7 +279,6 @@ async def recent_cmd(bot, message):
             "Make sure the bot is admin in RESULTS_CHANNEL."
         )
 
-    # Build preview list grouped by channel
     lines   = ["🆕 <b>New Arrivals</b>\n"]
     prev_ch = None
     for i, (hit, _fwd) in enumerate(sent_msgs, 1):
@@ -284,11 +286,9 @@ async def recent_cmd(bot, message):
         raw   = (hit.get("text") or hit.get("file_name") or "").strip()
         title = _extract_title_from_stored(raw) or f"Post #{hit['message_id']}"
         age   = _time_ago(hit.get("indexed_at"))
-
         if ch_id != prev_ch:
             lines.append(f"\n📡 <b>{ch_names[ch_id]}</b>")
             prev_ch = ch_id
-
         lines.append(f"{i}. {html.escape(title)} — <i>{age}</i>")
 
     lines.append(f"\n<i>{len(sent_msgs)} post(s) forwarded to results channel</i>")
@@ -301,13 +301,16 @@ async def recent_cmd(bot, message):
         ]])
     )
 
-    # Auto-delete reply + forwarded messages after TTL
     expire = time() + SEARCH_REPLY_TTL
     await save_dlt_message(reply, expire)
     await save_dlt_message(message, expire)
     for _hit, fwd in sent_msgs:
         await save_dlt_message(fwd, expire)
 
+
+# ---------------------------------------------------------------------------
+# /trending
+# ---------------------------------------------------------------------------
 
 @Client.on_message(filters.command("trending"))
 async def trending_cmd(bot, message):
@@ -344,11 +347,14 @@ async def trending_cmd(bot, message):
     await message.reply("\n".join(lines))
 
 
+# ---------------------------------------------------------------------------
+# /requests  (owner only)
+# ---------------------------------------------------------------------------
+
 @Client.on_message(filters.command("requests") & filters.user(OWNER_ID))
 async def requests_cmd(bot, message):
     args      = message.command[1:]
-    show_done = args and args[0].lower() in ("done", "fulfilled")
-    fulfilled = show_done
+    fulfilled = bool(args and args[0].lower() in ("done", "fulfilled"))
 
     items = await get_requests(limit=20, fulfilled=fulfilled)
     total = await get_request_count(fulfilled=fulfilled)
@@ -364,8 +370,8 @@ async def requests_cmd(bot, message):
 
     heading = "✅ Fulfilled Requests" if fulfilled else "📋 Pending Content Requests"
     lines   = [f"<b>{heading}</b>  ({total} unique title{'s' if total != 1 else ''})\n"]
-
     buttons = []
+
     for i, item in enumerate(items, 1):
         label = html.escape(item["query"])
         count = item["count"]
@@ -449,6 +455,127 @@ async def fulfill_cb(bot, update):
         pass
 
 
+# ---------------------------------------------------------------------------
+# /broadcast  (owner only)
+# ---------------------------------------------------------------------------
+
+@Client.on_message(filters.command("broadcast") & filters.user(OWNER_ID))
+async def broadcast_cmd(bot, message):
+    """
+    Send an announcement to every registered group.
+
+    Usage:
+      /broadcast Your message text here
+      — OR —
+      Reply to any message with /broadcast  (forwards that message to all groups)
+    """
+    _, groups = await get_groups()
+
+    if not groups:
+        return await message.reply("📭 No registered groups yet.")
+
+    # Determine what to send
+    text_to_send: str | None = None
+    reply_source = message.reply_to_message  # message the owner replied to, if any
+
+    args = message.command[1:]
+    if args:
+        text_to_send = " ".join(args)
+    elif not reply_source:
+        return await message.reply(
+            "📢 <b>Broadcast usage:</b>\n\n"
+            "<code>/broadcast Your announcement here</code>\n\n"
+            "— <b>or</b> —\n\n"
+            "Reply to any message (text, photo, video…) with:\n"
+            "<code>/broadcast</code>\n\n"
+            "The message will be sent to all <b>{}</b> registered group(s).".format(len(groups))
+        )
+
+    # Progress message
+    prog = await message.reply(
+        f"📢 Broadcasting to <b>{len(groups)}</b> group(s)…"
+    )
+
+    sent    = 0
+    failed  = 0
+    blocked = []
+
+    for group in groups:
+        gid = group["_id"]
+        try:
+            if reply_source:
+                await bot.forward_messages(
+                    chat_id=gid,
+                    from_chat_id=reply_source.chat.id,
+                    message_ids=reply_source.id,
+                )
+            else:
+                await bot.send_message(gid, text_to_send)
+            sent += 1
+        except FloodWait as e:
+            logger.warning("broadcast: FloodWait %ds", e.value)
+            await asyncio.sleep(e.value + 1)
+            # Retry once after wait
+            try:
+                if reply_source:
+                    await bot.forward_messages(
+                        chat_id=gid,
+                        from_chat_id=reply_source.chat.id,
+                        message_ids=reply_source.id,
+                    )
+                else:
+                    await bot.send_message(gid, text_to_send)
+                sent += 1
+            except Exception:
+                failed += 1
+                blocked.append(gid)
+        except Exception as e:
+            logger.warning("broadcast: failed to send to %d: %s", gid, e)
+            failed += 1
+            blocked.append(gid)
+
+        # Small delay between groups to stay well under Telegram rate limits
+        await asyncio.sleep(0.4)
+
+    # Final report
+    lines = [
+        f"📢 <b>Broadcast complete</b>\n",
+        f"✅ Delivered: <b>{sent}</b> / {len(groups)} group(s)",
+    ]
+    if failed:
+        lines.append(f"❌ Failed: <b>{failed}</b> group(s)")
+        if blocked:
+            ids = ", ".join(f"<code>{g}</code>" for g in blocked[:5])
+            if len(blocked) > 5:
+                ids += f" … (+{len(blocked) - 5} more)"
+            lines.append(f"   └ {ids}")
+
+    try:
+        await prog.edit("\n".join(lines))
+    except Exception:
+        await message.reply("\n".join(lines))
+
+    # Log to LOG_CHANNEL
+    if LOG_CHANNEL:
+        preview = (
+            html.escape(text_to_send[:80]) + ("…" if len(text_to_send) > 80 else "")
+            if text_to_send else "<i>[forwarded message]</i>"
+        )
+        try:
+            await bot.send_message(
+                LOG_CHANNEL,
+                f"📢 <b>Broadcast sent</b>\n"
+                f"To: {sent}/{len(groups)} groups\n"
+                f"Message: {preview}",
+            )
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# /stats  (owner only)
+# ---------------------------------------------------------------------------
+
 @Client.on_message(filters.command("stats") & filters.user(OWNER_ID))
 async def stats(bot, message):
     grp_count, _ = await get_groups()
@@ -477,6 +604,10 @@ async def stats(bot, message):
         f"✅ Fulfilled requests: <b>{req_done}</b> title(s)"
     )
 
+
+# ---------------------------------------------------------------------------
+# /ping
+# ---------------------------------------------------------------------------
 
 @Client.on_message(filters.command("ping"))
 async def ping(bot, message):
