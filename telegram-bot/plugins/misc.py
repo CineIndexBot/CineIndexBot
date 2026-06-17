@@ -16,6 +16,7 @@ from database.db import (
     get_requests, fulfill_request, get_request_count,
     get_recent_messages, save_dlt_message,
 )
+from utils.helpers import get_results_url
 
 logger = logging.getLogger(__name__)
 
@@ -45,24 +46,6 @@ Just send any movie or series name in the group.
 /stats — bot statistics (owner only)
 /ping — check if bot is alive
 """
-
-_rc_username: str | None = None
-_rc_resolved: bool = False
-
-
-async def _get_results_url(bot, message_id: int) -> str:
-    global _rc_username, _rc_resolved
-    if not _rc_resolved:
-        try:
-            chat = await bot.get_chat(RESULTS_CHANNEL)
-            _rc_username = getattr(chat, "username", None)
-            _rc_resolved = True
-        except Exception:
-            _rc_username = None
-    if _rc_username:
-        return f"https://t.me/{_rc_username}/{message_id}"
-    numeric_id = str(RESULTS_CHANNEL).replace("-100", "")
-    return f"https://t.me/c/{numeric_id}/{message_id}"
 
 
 def _time_ago(dt: datetime) -> str:
@@ -293,7 +276,7 @@ async def recent_cmd(bot, message):
 
     lines.append(f"\n<i>{len(sent_msgs)} post(s) forwarded to results channel</i>")
 
-    first_url = await _get_results_url(bot, sent_msgs[0][1].id)
+    first_url = await get_results_url(bot, sent_msgs[0][1].id, RESULTS_CHANNEL)
     reply = await message.reply(
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup([[
@@ -474,9 +457,8 @@ async def broadcast_cmd(bot, message):
     if not groups:
         return await message.reply("📭 No registered groups yet.")
 
-    # Determine what to send
     text_to_send: str | None = None
-    reply_source = message.reply_to_message  # message the owner replied to, if any
+    reply_source = message.reply_to_message
 
     args = message.command[1:]
     if args:
@@ -491,7 +473,6 @@ async def broadcast_cmd(bot, message):
             "The message will be sent to all <b>{}</b> registered group(s).".format(len(groups))
         )
 
-    # Progress message
     prog = await message.reply(
         f"📢 Broadcasting to <b>{len(groups)}</b> group(s)…"
     )
@@ -515,7 +496,6 @@ async def broadcast_cmd(bot, message):
         except FloodWait as e:
             logger.warning("broadcast: FloodWait %ds", e.value)
             await asyncio.sleep(e.value + 1)
-            # Retry once after wait
             try:
                 if reply_source:
                     await bot.forward_messages(
@@ -534,10 +514,8 @@ async def broadcast_cmd(bot, message):
             failed += 1
             blocked.append(gid)
 
-        # Small delay between groups to stay well under Telegram rate limits
         await asyncio.sleep(0.4)
 
-    # Final report
     lines = [
         f"📢 <b>Broadcast complete</b>\n",
         f"✅ Delivered: <b>{sent}</b> / {len(groups)} group(s)",
@@ -555,7 +533,6 @@ async def broadcast_cmd(bot, message):
     except Exception:
         await message.reply("\n".join(lines))
 
-    # Log to LOG_CHANNEL
     if LOG_CHANNEL:
         preview = (
             html.escape(text_to_send[:80]) + ("…" if len(text_to_send) > 80 else "")
