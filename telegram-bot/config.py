@@ -7,7 +7,9 @@ API_ID    = int(os.environ.get("API_ID", 0))
 API_HASH  = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 OWNER_ID  = int(os.environ.get("OWNER_ID", 0))
-LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", 0))
+
+# Guard: int("") raises ValueError — use `or 0` to treat empty string as unset
+LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL") or 0)
 
 _rc = os.environ.get("RESULTS_CHANNEL", "0")
 try:
@@ -27,3 +29,9 @@ if not API_ID or not API_HASH or not BOT_TOKEN:
 
 if not MONGO_URI:
     raise RuntimeError("MONGO_URI is required — set the full Atlas connection string in Railway Variables.")
+
+if not RESULTS_CHANNEL or RESULTS_CHANNEL == "0" or RESULTS_CHANNEL == 0:
+    logger.warning(
+        "RESULTS_CHANNEL is not configured — search results cannot be forwarded! "
+        "Set RESULTS_CHANNEL to your results channel ID (e.g. -1001234567890) in Railway Variables."
+    )
