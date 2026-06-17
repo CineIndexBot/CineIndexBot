@@ -7,12 +7,14 @@ API_ID    = int(os.environ.get("API_ID", 0))
 API_HASH  = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 OWNER_ID  = int(os.environ.get("OWNER_ID", 0))
-LOG_CHANNEL     = int(os.environ.get("LOG_CHANNEL", 0))
-RESULTS_CHANNEL = int(os.environ.get("RESULTS_CHANNEL", 0))
+LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", 0))
 
-# Always use MONGO_URI directly — full Atlas connection string set in Railway Variables.
-# MONGODB_PASSWORD is NOT used; it pointed to an old cluster and is removed to avoid
-# silently connecting to the wrong database if that env var is ever present.
+_rc = os.environ.get("RESULTS_CHANNEL", "0")
+try:
+    RESULTS_CHANNEL = int(_rc)
+except ValueError:
+    RESULTS_CHANNEL = _rc
+
 MONGO_URI = os.environ.get("MONGO_URI", "")
 
 SEARCH_REPLY_TTL = 15 * 60
