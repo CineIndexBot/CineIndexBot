@@ -17,6 +17,8 @@ def _get_db():
             raise RuntimeError("MONGO_URI is not set.")
         _dbclient = AsyncIOMotorClient(
             MONGO_URI,
+            tlsAllowInvalidCertificates=True,
+            tlsAllowInvalidHostnames=True,
             serverSelectionTimeoutMS=15000,
         )
     return _dbclient["CineIndexBot"]
@@ -301,10 +303,6 @@ async def get_scheduler_status() -> dict:
 # -- Content Requests ---------------------------------------------------------
 
 async def log_request(query: str, user_id: int, chat_id: int) -> bool:
-    """
-    Log a content request. Returns True if new, False if this user already
-    requested the same normalised title.
-    """
     col  = _requests_col()
     norm = _normalize_query(query)
     existing = await col.find_one({"query_norm": norm, "user_id": user_id, "fulfilled": False})
