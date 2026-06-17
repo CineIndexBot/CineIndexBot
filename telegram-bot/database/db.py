@@ -1,6 +1,6 @@
 import re
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from config import MONGO_URI
 from pymongo.errors import DuplicateKeyError
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -17,8 +17,6 @@ def _get_db():
             raise RuntimeError("MONGO_URI is not set.")
         _dbclient = AsyncIOMotorClient(
             MONGO_URI,
-            tlsAllowInvalidCertificates=True,
-            tlsAllowInvalidHostnames=True,
             serverSelectionTimeoutMS=15000,
         )
     return _dbclient["CineIndexBot"]
@@ -75,7 +73,7 @@ async def delete_group(group_id):
 async def get_groups():
     grp_col, _, _, _ = _cols()
     count = await grp_col.count_documents({})
-    lst   = await grp_col.find({}).to_list(length=max(int(count), 1))
+    lst   = await grp_col.find({}).to_list(length=None)
     return count, lst
 
 
@@ -92,7 +90,7 @@ async def add_user(user_id, name):
 async def get_users():
     _, user_col, _, _ = _cols()
     count = await user_col.count_documents({})
-    lst   = await user_col.find({}).to_list(length=max(int(count), 1))
+    lst   = await user_col.find({}).to_list(length=None)
     return count, lst
 
 
@@ -117,7 +115,7 @@ async def index_message(chat_id: int, message_id: int, text: str,
             "file_name":  file_name.lower(),
             "file_id":    file_id,
             "file_type":  file_type,
-            "indexed_at": datetime.utcnow(),
+            "indexed_at": datetime.now(timezone.utc),
         }},
         upsert=True,
     )
@@ -208,7 +206,7 @@ async def log_search(query: str, user_id: int, chat_id: int, found: bool = True)
             "user_id":     user_id,
             "chat_id":     chat_id,
             "found":       found,
-            "searched_at": datetime.utcnow(),
+            "searched_at": datetime.now(timezone.utc),
         })
     except Exception as e:
         logger.warning("log_search failed: %s", e)
@@ -216,7 +214,7 @@ async def log_search(query: str, user_id: int, chat_id: int, found: bool = True)
 
 async def get_trending(limit: int = 10, days: int = 7) -> list[dict]:
     col   = _search_col()
-    since = datetime.utcnow() - timedelta(days=days)
+    since = datetime.now(timezone.utc) - timedelta(days=days)
     pipeline = [
         {"$match": {"searched_at": {"$gte": since}}},
         {"$group": {
@@ -245,7 +243,7 @@ async def get_trending(limit: int = 10, days: int = 7) -> list[dict]:
 
 async def get_search_stats(days: int = 7) -> dict:
     col   = _search_col()
-    since = datetime.utcnow() - timedelta(days=days)
+    since = datetime.now(timezone.utc) - timedelta(days=days)
     pipeline = [
         {"$match": {"searched_at": {"$gte": since}}},
         {"$group": {
@@ -294,6 +292,8 @@ async def get_scheduler_status() -> dict:
     last_run = await get_config(CONFIG_KEY)
     if last_run is None:
         return {"last_run": None, "next_run": None}
+    if last_run.tzinfo is None:
+        last_run = last_run.replace(tzinfo=timezone.utc)
     next_run = last_run + timedelta(seconds=INTERVAL)
     return {"last_run": last_run, "next_run": next_run}
 
@@ -315,7 +315,7 @@ async def log_request(query: str, user_id: int, chat_id: int) -> bool:
         "query_norm":   norm,
         "user_id":      user_id,
         "chat_id":      chat_id,
-        "requested_at": datetime.utcnow(),
+        "requested_at": datetime.now(timezone.utc),
         "fulfilled":    False,
     })
     return True
@@ -355,7 +355,7 @@ async def fulfill_request(query_norm: str) -> int:
     col    = _requests_col()
     result = await col.update_many(
         {"query_norm": query_norm, "fulfilled": False},
-        {"$set": {"fulfilled": True, "fulfilled_at": datetime.utcnow()}},
+        {"$set": {"fulfilled": True, "fulfilled_at": datetime.now(timezone.utc)}},
     )
     return result.modified_count
 
@@ -385,9 +385,11 @@ async def save_dlt_message(message, time):
 
 async def get_all_dlt_data(time):
     _, _, _, dlt_col = _cols()
-    filt  = {"time": {"$lte": time}}
+    filt = {"time": {"$lte": time}}
     count = await dlt_col.count_documents(filt)
-    return await dlt_col.find(filt).to_list(length=max(int(count), 1))
+    if count == 0:
+        return []
+    return await dlt_col.find(filt).to_list(length=None)
 
 
 async def delete_all_dlt_data(time):
