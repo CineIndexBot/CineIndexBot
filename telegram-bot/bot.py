@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import signal
 import sys
 import threading
@@ -55,18 +56,39 @@ async def _start_bot_with_retry() -> None:
 async def _reset_zombie_sessions() -> None:
     """
     Kill all other MTProto sessions for this bot on Telegram's side.
-
-    Each Railway restart with in_memory=True creates a NEW auth key,
-    leaving the old ones as ghosts. Telegram may route updates to a ghost
-    session instead of the current live one, causing the bot to receive
-    zero updates even though it appears connected. ResetAuthorizations
-    tells Telegram to revoke every session EXCEPT the current one.
+    Safe to call even when SESSION_STRING is set — keeps the current session.
     """
     try:
         await Bot.invoke(ResetAuthorizations())
         logger.info("✅ Zombie sessions cleared — this is now the only active session.")
     except Exception as e:
         logger.warning("⚠️  ResetAuthorizations failed (non-fatal): %s", e)
+
+
+async def _export_session_if_needed() -> None:
+    """
+    If SESSION_STRING is not yet configured, export it and print to Railway logs
+    so the user can copy it into Railway Variables. This makes future restarts
+    use the same auth key (like CineRequestBot does with its SESSION env var).
+    """
+    if os.environ.get("SESSION_STRING", "").strip():
+        logger.info("✅ Using persistent SESSION_STRING — no zombie sessions possible.")
+        return
+    try:
+        session_str = await Bot.export_session_string()
+        logger.info(
+            "\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🔑  SESSION_STRING not set. To make the bot work\n"
+            "    permanently, add this to Railway Variables:\n\n"
+            "    Key:   SESSION_STRING\n"
+            "    Value: %s\n\n"
+            "    Until then, each restart may lose updates.\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            session_str,
+        )
+    except Exception as e:
+        logger.warning("Could not export session string: %s", e)
 
 
 async def main():
@@ -81,7 +103,11 @@ async def main():
     me = await Bot.get_me()
     logger.info("Bot started: @%s", me.username)
 
+    # 1. Kill zombie sessions from previous in_memory restarts
     await _reset_zombie_sessions()
+
+    # 2. If no SESSION_STRING configured, print it so user can set it in Railway
+    await _export_session_if_needed()
 
     delete_task    = asyncio.create_task(auto_delete_loop(Bot))
     scheduler_task = asyncio.create_task(scheduled_backfill_loop(Bot))
