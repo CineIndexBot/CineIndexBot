@@ -115,35 +115,45 @@ def _extract_title_from_stored(text: str) -> str:
 
 @Client.on_message(filters.command("start"))
 async def start(bot, message):
-    user = message.from_user
-    if user:
-        await add_user(user.id, user.first_name)
+    logger.info("start handler called: chat_id=%s user_id=%s",
+                message.chat.id,
+                message.from_user.id if message.from_user else None)
+    try:
+        user = message.from_user
+        if user:
+            await add_user(user.id, user.first_name)
 
-    if message.chat.type.name in ("GROUP", "SUPERGROUP"):
-        group = await get_group(message.chat.id)
-        if not group:
-            await add_group(
-                group_id=message.chat.id,
-                group_name=message.chat.title or "",
-                user_id=user.id if user else 0,
-            )
-            if LOG_CHANNEL:
-                try:
-                    await bot.send_message(
-                        LOG_CHANNEL,
-                        f"📌 New group registered:\n"
-                        f"<b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
-                        f"By: {user.mention if user else 'unknown'}",
-                    )
-                except Exception:
-                    pass
+        if message.chat.type.name in ("GROUP", "SUPERGROUP"):
+            group = await get_group(message.chat.id)
+            if not group:
+                await add_group(
+                    group_id=message.chat.id,
+                    group_name=message.chat.title or "",
+                    user_id=user.id if user else 0,
+                )
+                if LOG_CHANNEL:
+                    try:
+                        await bot.send_message(
+                            LOG_CHANNEL,
+                            f"📌 New group registered:\n"
+                            f"<b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
+                            f"By: {user.mention if user else 'unknown'}",
+                        )
+                    except Exception:
+                        pass
 
-    await message.reply(
-        START_TEXT,
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("ℹ️ Help", callback_data="help_cb")
-        ]])
-    )
+        await message.reply(
+            START_TEXT,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("ℹ️ Help", callback_data="help_cb")
+            ]])
+        )
+    except Exception as exc:
+        logger.error("start handler FAILED: %s", exc, exc_info=True)
+        try:
+            await message.reply("⚠️ Bot error — check logs.")
+        except Exception:
+            pass
 
 
 @Client.on_message(filters.command("help"))
