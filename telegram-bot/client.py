@@ -8,4 +8,5 @@ Bot = Client(
     bot_token=BOT_TOKEN,
     in_memory=True,
     plugins={"root": "plugins"},
+    sleep_threshold=60,
 )
