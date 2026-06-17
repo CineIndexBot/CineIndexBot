@@ -12,6 +12,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 from pyrogram.errors import FloodWait
+from pyrogram.raw.functions.auth import ResetAuthorizations
 from client import Bot
 from database.db import create_indexes
 from plugins.autodelete import auto_delete_loop
@@ -51,6 +52,23 @@ async def _start_bot_with_retry() -> None:
             raise
 
 
+async def _reset_zombie_sessions() -> None:
+    """
+    Kill all other MTProto sessions for this bot on Telegram's side.
+
+    Each Railway restart with in_memory=True creates a NEW auth key,
+    leaving the old ones as ghosts. Telegram may route updates to a ghost
+    session instead of the current live one, causing the bot to receive
+    zero updates even though it appears connected. ResetAuthorizations
+    tells Telegram to revoke every session EXCEPT the current one.
+    """
+    try:
+        await Bot.invoke(ResetAuthorizations())
+        logger.info("✅ Zombie sessions cleared — this is now the only active session.")
+    except Exception as e:
+        logger.warning("⚠️  ResetAuthorizations failed (non-fatal): %s", e)
+
+
 async def main():
     t = threading.Thread(target=_start_health_server, daemon=True)
     t.start()
@@ -62,6 +80,8 @@ async def main():
 
     me = await Bot.get_me()
     logger.info("Bot started: @%s", me.username)
+
+    await _reset_zombie_sessions()
 
     delete_task    = asyncio.create_task(auto_delete_loop(Bot))
     scheduler_task = asyncio.create_task(scheduled_backfill_loop(Bot))
