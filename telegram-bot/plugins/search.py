@@ -43,6 +43,7 @@ async def _get_results_url(bot, message_id: int) -> str:
 
 
 async def _send_result(bot, result_chat: int, source_chat: int, message_id: int):
+    """Forward one message to the results channel. Returns the forwarded Message or None."""
     try:
         return await bot.forward_messages(
             chat_id=result_chat,
@@ -51,11 +52,18 @@ async def _send_result(bot, result_chat: int, source_chat: int, message_id: int)
         )
     except FloodWait as e:
         await asyncio.sleep(e.value + 1)
-        return await bot.forward_messages(
-            chat_id=result_chat,
-            from_chat_id=source_chat,
-            message_ids=message_id,
-        )
+        # BUG FIX: retry was previously unprotected — a second exception would crash the
+        # entire search handler. Now wrapped so we return None gracefully on retry failure.
+        try:
+            return await bot.forward_messages(
+                chat_id=result_chat,
+                from_chat_id=source_chat,
+                message_ids=message_id,
+            )
+        except Exception as retry_e:
+            logger.warning("Forward retry failed (chat=%d msg=%d): %s",
+                           source_chat, message_id, retry_e)
+            return None
     except Exception as e:
         logger.warning("Forward failed (chat=%d msg=%d): %s", source_chat, message_id, e)
         return None
