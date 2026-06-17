@@ -9,7 +9,7 @@ Last-run time persisted in MongoDB so Railway restarts don't reset the clock.
 import asyncio
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 from pyrogram.errors import FloodWait, ChatAdminRequired, ChannelPrivate
 
@@ -65,7 +65,6 @@ async def _reindex_channel(bot, ch_id: int) -> tuple[int, int]:
     max_retries   = 3
 
     for attempt in range(1, max_retries + 1):
-        # Reset per-attempt counters so retry doesn't double-count
         attempt_indexed = 0
         attempt_skipped = 0
         try:
@@ -87,7 +86,6 @@ async def _reindex_channel(bot, ch_id: int) -> tuple[int, int]:
                 except Exception as e:
                     logger.warning("Scheduler index error msg %d: %s", message.id, e)
 
-            # Successful full pass
             return total_indexed + attempt_indexed, total_skipped + attempt_skipped
 
         except FloodWait as e:
@@ -96,7 +94,6 @@ async def _reindex_channel(bot, ch_id: int) -> tuple[int, int]:
                 "Scheduler FloodWait %ds on channel %d (attempt %d/%d)",
                 e.value, ch_id, attempt, max_retries,
             )
-            # Do NOT accumulate partial attempt_indexed — we'll retry from scratch
             await asyncio.sleep(wait)
 
         except (ChatAdminRequired, ChannelPrivate) as e:
@@ -111,7 +108,6 @@ async def _reindex_channel(bot, ch_id: int) -> tuple[int, int]:
                            ch_id, attempt, e)
             return total_indexed + attempt_indexed, total_skipped + attempt_skipped
 
-    # All retries exhausted
     return total_indexed, total_skipped
 
 
@@ -191,16 +187,18 @@ async def scheduled_backfill_loop(bot):
     while True:
         try:
             last_run = await get_config(CONFIG_KEY)
-            now      = datetime.utcnow()
+            now      = datetime.now(timezone.utc)
 
             if last_run is None:
                 logger.info("Scheduler: first ever run in %ds.", WARMUP_DELAY)
                 await asyncio.sleep(WARMUP_DELAY)
             else:
+                # Motor returns naive UTC datetimes from MongoDB; normalise before arithmetic
+                if last_run.tzinfo is None:
+                    last_run = last_run.replace(tzinfo=timezone.utc)
                 elapsed   = (now - last_run).total_seconds()
                 remaining = INTERVAL - elapsed
                 if remaining > 0:
-                    from datetime import timedelta
                     next_dt = now + timedelta(seconds=remaining)
                     logger.info(
                         "Scheduler: last run %s ago. Next at %s UTC.",
@@ -211,7 +209,7 @@ async def scheduled_backfill_loop(bot):
                     logger.info("Scheduler: overdue by %s, running now.", _fmt(-remaining))
 
             await _run_full_reindex(bot)
-            await set_config(CONFIG_KEY, datetime.utcnow())
+            await set_config(CONFIG_KEY, datetime.now(timezone.utc))
             await asyncio.sleep(INTERVAL)
 
         except asyncio.CancelledError:
