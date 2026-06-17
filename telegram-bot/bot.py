@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import signal
 import sys
 import threading
 
@@ -29,39 +30,16 @@ def _start_health_server():
         app.run(host="0.0.0.0", port=HEALTH_PORT, use_reloader=False)
 
 
-async def main():
-    await create_indexes()
-
-    # Health server stays up permanently (even during FloodWait sleep)
-    t = threading.Thread(target=_start_health_server, daemon=True)
-    t.start()
-
-    logger.info("Starting CineIndexBot...")
-
+async def _start_bot_with_retry() -> None:
+    """Connect the bot, sleeping through any FloodWait on auth."""
     while True:
         try:
-            async with Bot:
-                me = await Bot.get_me()
-                logger.info("Bot started: @%s", me.username)
-
-                delete_task    = asyncio.create_task(auto_delete_loop(Bot))
-                scheduler_task = asyncio.create_task(scheduled_backfill_loop(Bot))
-
-                try:
-                    await asyncio.Event().wait()
-                finally:
-                    for task in (delete_task, scheduler_task):
-                        task.cancel()
-                        try:
-                            await task
-                        except asyncio.CancelledError:
-                            pass
-            break
-
+            await Bot.start()
+            return
         except FloodWait as e:
             wait = e.value + 10
             logger.warning(
-                "Telegram FloodWait %ds on login. Sleeping %ds then retrying...",
+                "Telegram FloodWait %ds on login — retrying in %ds...",
                 e.value, wait,
             )
             try:
@@ -69,12 +47,55 @@ async def main():
             except Exception:
                 pass
             await asyncio.sleep(wait)
-            logger.info("FloodWait over — retrying...")
+        except Exception:
+            raise
 
-        except Exception as e:
-            logger.exception("Bot crashed: %s", e)
-            sys.exit(1)
+
+async def main():
+    t = threading.Thread(target=_start_health_server, daemon=True)
+    t.start()
+
+    await create_indexes()
+    logger.info("Starting CineIndexBot...")
+
+    await _start_bot_with_retry()
+
+    me = await Bot.get_me()
+    logger.info("Bot started: @%s", me.username)
+
+    delete_task    = asyncio.create_task(auto_delete_loop(Bot))
+    scheduler_task = asyncio.create_task(scheduled_backfill_loop(Bot))
+
+    stop_event = asyncio.Event()
+
+    def _handle_signal():
+        logger.info("Shutdown signal received — stopping gracefully...")
+        stop_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _handle_signal)
+        except NotImplementedError:
+            pass
+
+    logger.info("Bot is running. SIGTERM/Ctrl+C to stop.")
+    await stop_event.wait()
+
+    logger.info("Shutting down tasks...")
+    for task in (delete_task, scheduler_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    await Bot.stop()
+    logger.info("Bot stopped cleanly.")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Stopped by user.")
