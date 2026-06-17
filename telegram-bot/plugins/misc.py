@@ -609,16 +609,3 @@ async def stats(bot, message):
 async def ping(bot, message):
     await message.reply("🏓 Pong!")
 
-
-# ---------------------------------------------------------------------------
-# DEBUG: catch-all private message handler (remove after diagnosis)
-# ---------------------------------------------------------------------------
-
-@Client.on_message(filters.private, group=999)
-async def debug_private_catchall(bot, message):
-    logger.info(
-        "DEBUG catchall: chat_id=%s from_user=%s text=%r",
-        message.chat.id,
-        message.from_user.id if message.from_user else None,
-        (message.text or message.caption or '')[:80],
-    )
