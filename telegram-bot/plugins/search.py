@@ -12,7 +12,6 @@ from config import RESULTS_CHANNEL, SEARCH_REPLY_TTL
 from database.db import (
     get_group, add_user, save_dlt_message, search_index, log_search, log_request,
 )
-from utils.helpers import get_results_url
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +22,24 @@ _EXCLUDED_COMMANDS = [
     "connections", "stats", "broadcast", "ping", "verify", "backfill",
     "status", "trending", "requests", "recent",
 ]
+
+_results_channel_username: str | None = None
+_results_channel_resolved: bool = False
+
+
+async def _get_results_url(bot, message_id: int) -> str:
+    global _results_channel_username, _results_channel_resolved
+    if not _results_channel_resolved:
+        try:
+            chat = await bot.get_chat(RESULTS_CHANNEL)
+            _results_channel_username = getattr(chat, "username", None)
+            _results_channel_resolved = True
+        except Exception:
+            _results_channel_username = None
+    if _results_channel_username:
+        return f"https://t.me/{_results_channel_username}/{message_id}"
+    numeric_id = str(RESULTS_CHANNEL).replace("-100", "")
+    return f"https://t.me/c/{numeric_id}/{message_id}"
 
 
 async def _send_result(bot, result_chat: int, source_chat: int, message_id: int):
@@ -178,7 +195,7 @@ async def request_cb(bot, update):
 
 
 # ---------------------------------------------------------------------------
-# Search handler
+# Search handler  (bug fix: ~filters.bot prevents bot replies triggering searches)
 # ---------------------------------------------------------------------------
 
 @Client.on_message(filters.group & ~filters.bot & ~filters.command(_EXCLUDED_COMMANDS))
@@ -239,7 +256,7 @@ async def search(bot, message):
             "Make sure the bot is admin in the RESULTS_CHANNEL."
         )
 
-    first_url = await get_results_url(bot, sent_msgs[0].id, RESULTS_CHANNEL)
+    first_url = await _get_results_url(bot, sent_msgs[0].id)
 
     if total_raw > total_uniq:
         result_line = (
